@@ -1,0 +1,1601 @@
+﻿#include "framework.h"
+#include <wincrypt.h>
+
+#include <tchar.h>
+#include <cstdint>
+#include <string>
+#include <vector>
+#include <chrono>  
+#include <random>
+#include <algorithm>
+#include <cctype>
+
+#include "vehbp.h"
+#include "revoke_tip.h"
+#include <sys/stat.h>
+#include <TlHelp32.h>
+
+//用于读取ini配置
+#include "inicpp.h" 
+
+//用于计算MD5
+#pragma comment(lib, "crypt32.lib")
+
+//打印日志
+static HANDLE g_hLogFile = INVALID_HANDLE_VALUE;
+
+//VEH + INT3断点
+static void* g_bpDelMsg = nullptr;
+static void* g_bpAdd2DB = nullptr;
+
+static DWORD g_tlsThreadState = TLS_OUT_OF_INDEXES;
+struct ThreadState
+{
+    uint8_t last_org_srvid[8];      //真实的srvid 防止插入两条撤回提醒
+    uint8_t anti_revoke_cur_msg;    //是否防撤回当前这条消息
+    char pending_content[512];      // DelMsg.RDX+0x1A0 原文 / [图片] 等, 同线程带给 Add2DB
+};
+
+static ThreadState* GetThreadState()
+{
+    if (g_tlsThreadState == TLS_OUT_OF_INDEXES)
+        return nullptr;
+
+    ThreadState* state = reinterpret_cast<ThreadState*>(TlsGetValue(g_tlsThreadState));
+    if (state != nullptr)
+        return state;
+
+    state = reinterpret_cast<ThreadState*>(
+        HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(ThreadState)));
+    if (state == nullptr)
+        return nullptr;
+
+    if (!TlsSetValue(g_tlsThreadState, state))
+    {
+        HeapFree(GetProcessHeap(), 0, state);
+        return nullptr;
+    }
+
+    return state;
+}
+
+static void FreeCurrentThreadState()
+{
+    if (g_tlsThreadState == TLS_OUT_OF_INDEXES)
+        return;
+
+    ThreadState* state = reinterpret_cast<ThreadState*>(TlsGetValue(g_tlsThreadState));
+    if (state != nullptr)
+    {
+        HeapFree(GetProcessHeap(), 0, state);
+        TlsSetValue(g_tlsThreadState, nullptr);
+    }
+}
+
+static bool InitThreadStateTls()
+{
+    if (g_tlsThreadState != TLS_OUT_OF_INDEXES)
+        return true;
+
+    g_tlsThreadState = TlsAlloc();
+    return g_tlsThreadState != TLS_OUT_OF_INDEXES;
+}
+
+static void UninitThreadStateTls()
+{
+    FreeCurrentThreadState();
+
+    if (g_tlsThreadState != TLS_OUT_OF_INDEXES)
+    {
+        TlsFree(g_tlsThreadState);
+        g_tlsThreadState = TLS_OUT_OF_INDEXES;
+    }
+}
+
+//配置信息
+struct BASICINFO
+{
+    uint64_t imgbase;           // Weixin.dll的基址
+	uint64_t add2db_offset;     // 将撤回消息添加到数据库的函数偏移
+	uint64_t delmsg_offset;     // 删除要撤回消息函数的偏移
+};
+
+struct DELMSGINFO
+{
+    bool initialized;
+    int arg_msg_index;      // 哪个参数(2/3/4)指向包含revoke_xml的结构体
+    int offset_revoke_xml;  // StdString在结构体中的偏移
+    int arg_notify_index;   // 哪个参数是notify标志(值为0的那个)
+};
+
+struct ADD2DBINFO
+{
+    bool initialized;
+    int arg_msg_index;      // 消息结构体参数, Config2 为 3 (R8)
+    int arg_bool_index;     // 允许新 srvid 的 bool, Config2 为 5 ([rsp+0x20])
+    int offset_srvid;       // srvid在消息结构体中的偏移
+    int offset_revoke_xml;  // revoke_xml StdString 偏移
+};
+
+struct CONFIGINFO
+{
+	BASICINFO basic_info;
+	DELMSGINFO delmsg_info;
+	ADD2DBINFO add2db_info;
+}g_config_info;
+
+//std::string的内存布局
+struct StdString
+{
+    const char data_ptr[16];
+    int64_t size;
+    int64_t capability;
+};
+
+ini::IniFile g_config;      //ini配置
+
+bool g_anti_revoke_self_msg = false; //是否防止自己撤回消息
+bool g_output_debeug_msg = false; //是否输出调试信息
+std::string g_tip_phrase = revoke_tip::kDefaultPhrase;
+bool g_block_update = false;
+static volatile LONG g_stopUpdateBlocker = 0;
+
+#define OUT_DEBUG_BUF_LEN   1024
+
+static void LogLine(const char *text)
+{
+    if (text == nullptr || text[0] == '\0')
+        return;
+    OutputDebugStringA(text);
+    if (g_hLogFile != INVALID_HANDLE_VALUE)
+    {
+        DWORD written = 0;
+        WriteFile(g_hLogFile, text, (DWORD)strlen(text), &written, nullptr);
+        WriteFile(g_hLogFile, "\n", 1, &written, nullptr);
+    }
+}
+
+void OutputDebugPrintf(const char* strOutputString, ...)
+{
+    if (!g_output_debeug_msg) return;
+
+    char strBuffer[OUT_DEBUG_BUF_LEN] = { 0 };
+    va_list vlArgs;
+    va_start(vlArgs, strOutputString);
+    _vsnprintf_s(strBuffer, sizeof(strBuffer) - 1, strOutputString, vlArgs);  //_vsnprintf_s  _vsnprintf
+    va_end(vlArgs);
+    OutputDebugStringA(strBuffer);  //OutputDebugString    // OutputDebugStringW
+
+	// 同时写入到文件log中
+    if (g_hLogFile != INVALID_HANDLE_VALUE)
+    {
+        DWORD dwWritten = 0;
+		strBuffer[strlen(strBuffer)] = '\n';  // 添加换行符
+        WriteFile(g_hLogFile, strBuffer, (DWORD)strlen(strBuffer), &dwWritten, NULL);
+    }
+}
+
+/**
+ * @brief 计算字节数据的MD5值.
+ * @param data 要计算的数据
+ * @return MD5 16位
+ */
+std::vector<uint8_t> CalculateMD5(const std::vector<uint8_t>& data) {
+    // 获取加密上下文
+    HCRYPTPROV hCryptProv = NULL;
+    if (!CryptAcquireContext(&hCryptProv, NULL, NULL, PROV_RSA_AES, CRYPT_VERIFYCONTEXT)) {
+        return {};
+    }
+
+    // 创建MD5哈希对象
+    HCRYPTPROV hHash = NULL;
+    if (!CryptCreateHash(hCryptProv, CALG_MD5, 0, 0, &hHash)) {
+        CryptReleaseContext(hCryptProv, 0);
+        return {};
+    }
+
+    // 输入数据
+    if (!CryptHashData(hHash, data.data(), data.size(), 0)) {
+        CryptDestroyHash(hHash);
+        CryptReleaseContext(hCryptProv, 0);
+        return {};
+    }
+
+    //获取哈希值大小
+    DWORD cbHashSize = 0, dwCount = sizeof(DWORD);
+    if (!CryptGetHashParam(hHash, HP_HASHSIZE, (BYTE*)&cbHashSize, &dwCount, 0)) {
+        CryptDestroyHash(hHash);
+        CryptReleaseContext(hCryptProv, 0);
+        return {};
+    }
+
+    // 获取哈希值
+    std::vector<uint8_t> md5Hash(cbHashSize);
+    if (!CryptGetHashParam(hHash, HP_HASHVAL, reinterpret_cast<BYTE*>(&md5Hash[0]), &cbHashSize, 0)) {
+        CryptDestroyHash(hHash);
+        CryptReleaseContext(hCryptProv, 0);
+        return {};
+    }
+
+    // 清理
+    CryptDestroyHash(hHash);
+    CryptReleaseContext(hCryptProv, 0);
+
+    //取中间8个字节
+    auto middle_start = md5Hash.begin() + 4;    //从第5个字节开始
+    auto middle_end = middle_start + 8;         //取8个字节
+    std::vector<uint8_t> md5Hash16(middle_start, middle_end);
+    return md5Hash16;
+}
+
+/**
+ * @brief 使用MD5计算出一个唯一的正数.
+ * @return 字节序列
+ */
+std::vector<uint8_t> GetUniquePositiveValue()
+{
+    // 获取当前时间戳(毫秒级别)
+    auto currentTime = std::chrono::high_resolution_clock::now().time_since_epoch().count();
+
+    // 生成一个随机数(加盐)
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_int_distribution<> dis(0, 255);
+    uint8_t randomValue = dis(gen);
+
+    std::vector<uint8_t> uniqueData;//要MD5的数据
+    uniqueData.push_back(static_cast<uint8_t>(currentTime & 0xFF));
+    uniqueData.push_back(static_cast<uint8_t>((currentTime >> 8) & 0xFF));
+    uniqueData.push_back(static_cast<uint8_t>((currentTime >> 16) & 0xFF));
+    uniqueData.push_back(static_cast<uint8_t>((currentTime >> 24) & 0xFF));
+    uniqueData.push_back(static_cast<uint8_t>((currentTime >> 32) & 0xFF));
+    uniqueData.push_back(static_cast<uint8_t>((currentTime >> 40) & 0xFF));
+    uniqueData.push_back(randomValue);//加盐确保唯一
+
+    std::vector<uint8_t> md5Result = CalculateMD5(uniqueData);
+    if (md5Result.size() == 0) return {};
+
+    //将0x123456第一个字节的最高位变为0, 确保是正数, 小端序实际存储中是最后一个字节
+    uint8_t littleEndByte = md5Result.back();
+    md5Result.back() = littleEndByte & 0x7F;// 0111 1111
+    return md5Result;
+}
+
+static bool FileExistsA(const char *path)
+{
+    struct stat buffer;
+    return path != nullptr && path[0] != '\0' && stat(path, &buffer) == 0;
+}
+
+static std::string FindIniPath(char *lpReserved)
+{
+    if (lpReserved != nullptr && FileExistsA(lpReserved))
+        return lpReserved;
+
+    char mod[MAX_PATH] = { 0 };
+    HMODULE self = NULL;
+    if (GetModuleHandleExA(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            (LPCSTR)&FindIniPath, &self)
+        && GetModuleFileNameA(self, mod, MAX_PATH) > 0)
+    {
+        std::string dir = mod;
+        size_t slash = dir.find_last_of("\\/");
+        if (slash != std::string::npos)
+        {
+            std::string cand = dir.substr(0, slash) + "\\RevokeHook.ini";
+            if (FileExistsA(cand.c_str()))
+                return cand;
+        }
+    }
+
+    return std::string();
+}
+
+static void KillWeixinUpdateOnce()
+{
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE)
+        return;
+    PROCESSENTRY32W pe{};
+    pe.dwSize = sizeof(pe);
+    if (Process32FirstW(snap, &pe))
+    {
+        do
+        {
+            if (_wcsicmp(pe.szExeFile, L"WeixinUpdate.exe") == 0)
+            {
+                HANDLE proc = OpenProcess(PROCESS_TERMINATE, FALSE, pe.th32ProcessID);
+                if (proc != nullptr)
+                {
+                    TerminateProcess(proc, 0);
+                    CloseHandle(proc);
+                }
+            }
+        } while (Process32NextW(snap, &pe));
+    }
+    CloseHandle(snap);
+}
+
+static DWORD WINAPI UpdateBlockerThread(LPVOID)
+{
+    while (InterlockedCompareExchange(&g_stopUpdateBlocker, 0, 0) == 0)
+    {
+        KillWeixinUpdateOnce();
+        Sleep(2000);
+    }
+    return 0;
+}
+
+/**
+ * @brief 读取配置信息.
+ */
+bool ReadExternalConfig(char* ini_path)
+{
+    std::string ini_path_str = FindIniPath(ini_path);
+    if (ini_path_str.empty())
+    {
+        OutputDebugString(TEXT("[RevokeHook] Not Find ini file!"));
+        return false;
+    }
+
+    g_config.load(ini_path_str);
+
+    HMODULE weixin_dll_base = NULL;
+    //加载当前dll的时候 Weixin.dll很可能还没有被加载
+    for (int try_num = 0; try_num < 100; try_num++)
+    {   //多次尝试 一共尝试100次 每次间隔300毫秒 即30秒
+        weixin_dll_base = GetModuleHandle(_T("Weixin.dll"));
+        if (weixin_dll_base != NULL)
+            break;
+        Sleep(300);
+    }
+    if (weixin_dll_base == NULL) {
+        OutputDebugString(TEXT("[RevokeHook] Get Weixin.dll Base Failed!"));
+        return false;
+	}
+
+	g_config_info.basic_info.imgbase = (uint64_t)weixin_dll_base;
+	g_config_info.basic_info.delmsg_offset = g_config["KeyFunc"]["DelMsgOffset"].as<int>();
+	g_config_info.basic_info.add2db_offset = g_config["KeyFunc"]["Add2DBOffset"].as<int>();
+
+	g_anti_revoke_self_msg = g_config["Setting"]["AntiRevokeSelf"].as<bool>();
+	g_output_debeug_msg = g_config["Setting"]["OutputDebugMsg"].as<bool>();
+		g_tip_phrase = revoke_tip::sanitizedPhrase(g_config["Setting"]["TipPhrase"].as<std::string>());
+    {
+        std::string block = g_config["Setting"]["BlockUpdate"].as<std::string>();
+        for (auto &ch : block)
+            ch = (char)toupper((unsigned char)ch);
+        g_block_update = (block == "TRUE" || block == "1");
+    }
+
+    OutputDebugPrintf("[RevokeHook] Use ini: %s", ini_path_str.c_str());
+    return true;
+}
+
+/**
+ * @brief 获取第index个参数的值.
+ * 
+ * @param ctx 上下文信息
+ * @param index 第几个参数, 从1开始
+ * @return 寄存器/栈上的值
+ */
+uint64_t GetArgValue(PCONTEXT ctx, int index)
+{
+    uint64_t* stack_args;
+    if (ctx == NULL || index <= 0)
+    {
+        return 0;
+    }
+
+    switch (index)
+    {
+    case 1:
+        return ctx->Rcx;
+    case 2:
+        return ctx->Rdx;
+    case 3:
+        return ctx->R8;
+    case 4:
+        return ctx->R9;
+    default:
+        /*
+         * MSVC x64 调用约定:
+         * [RSP + 0x00] = shadow space slot 1
+         * [RSP + 0x08] = shadow space slot 2
+         * [RSP + 0x10] = shadow space slot 3
+         * [RSP + 0x18] = shadow space slot 4
+         * [RSP + 0x20] = 第5个参数
+         */
+        stack_args = (uint64_t*)(ctx->Rsp + 0x20);
+        return stack_args[index - 5];
+    }
+}
+
+int SetArgValue(PCONTEXT ctx, int index, uint64_t value)
+{
+    uint64_t* stack_args;
+
+    if (ctx == NULL || index <= 0)
+    {
+        return 0;
+    }
+
+    switch (index)
+    {
+    case 1:
+        ctx->Rcx = value;
+        return 1;
+    case 2:
+        ctx->Rdx = value;
+        return 1;
+    case 3:
+        ctx->R8 = value;
+        return 1;
+    case 4:
+        ctx->R9 = value;
+        return 1;
+    default:
+        stack_args = (uint64_t*)(ctx->Rsp + 0x20);
+        stack_args[index - 5] = value;
+        return 1;
+    }
+}
+
+static bool IsMemoryReadable(const void* addr, size_t size)
+{
+    if (addr == nullptr || size == 0) return false;
+
+    MEMORY_BASIC_INFORMATION mbi;
+    if (VirtualQuery(addr, &mbi, sizeof(mbi)) == 0)
+        return false;
+    if (mbi.State != MEM_COMMIT)
+        return false;
+    if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD))
+        return false;
+    if (!(mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)))
+        return false;
+
+    uintptr_t region_end = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+    return ((uintptr_t)addr + size) <= region_end;
+}
+
+static bool SafeReadBytes(const void *addr, void *dst, size_t n)
+{
+    if (dst == nullptr || n == 0 || !IsMemoryReadable(addr, n))
+        return false;
+    __try
+    {
+        memcpy(dst, addr, n);
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+}
+
+static StdString* FindStdStringWithSig(uint64_t base_addr, size_t scan_range,
+    const uint8_t* sig, size_t sig_len)
+{
+    if (base_addr == 0)
+        return nullptr;
+
+    for (size_t offset = 0; offset + sizeof(StdString) <= scan_range; offset += 8)
+    {
+        uint64_t addr = base_addr + offset;
+        if (!IsMemoryReadable((void*)addr, sizeof(StdString)))
+            break;
+
+        StdString* ss = (StdString*)addr;
+
+        if (ss->size <= 16 || ss->size > 0x10000 ||
+            ss->capability < ss->size || ss->capability > 0x100000)
+            continue;
+
+        uint64_t str_addr = *((uint64_t*)(ss->data_ptr));
+        if (str_addr == 0 || !IsMemoryReadable((void*)str_addr, (size_t)ss->size))
+            continue;
+
+        for (int64_t i = 0; i <= (int64_t)ss->size - (int64_t)sig_len; i++)
+        {
+            if (memcmp((void*)(str_addr + i), sig, sig_len) == 0)
+                return ss;
+        }
+    }
+    return nullptr;
+}
+
+static int FindZeroArgIndex(PCONTEXT ctx, int start_idx, int end_idx)
+{
+    // Pass 1: 64-bit == 0
+    for (int i = start_idx; i <= end_idx; i++)
+    {
+        if (GetArgValue(ctx, i) == 0)
+            return i;
+    }
+    // Pass 2: low 32 bits == 0 (upper 32 might be garbage)
+    for (int i = start_idx; i <= end_idx; i++)
+    {
+        uint64_t val = GetArgValue(ctx, i);
+        if (val != 0 && (val & 0xFFFFFFFF) == 0)
+            return i;
+    }
+    // Pass 3: low byte == 0, not a user-mode pointer (stack bool with dirty high bits)
+    for (int i = start_idx; i <= end_idx; i++)
+    {
+        uint64_t val = GetArgValue(ctx, i);
+        if ((val & 0xFF) != 0)
+            continue;
+        if (val >= 0x10000 && val <= 0x00007FFFFFFFFFFF)
+            continue;
+        return i;
+    }
+    return -1;
+}
+
+static bool ReadMsStdString(const StdString *ss, std::string &out);
+
+static void DumpObjectStrings(uint64_t base, size_t range, const char *tag)
+{
+    if (!g_output_debeug_msg)
+        return;
+    if (base == 0 || range < sizeof(StdString) || !IsMemoryReadable((void *)base, 16))
+        return;
+    OutputDebugPrintf("[Dump] %s base=%p range=0x%X", tag, (void *)base, (unsigned)range);
+    for (size_t off = 0; off + sizeof(StdString) <= range; off += 8)
+    {
+        std::string value;
+        StdString *ss = (StdString *)(base + off);
+        if (!ReadMsStdString(ss, value) || value.empty())
+            continue;
+        for (char &ch : value)
+        {
+            if (ch == '\n' || ch == '\r' || ch == '\t')
+                ch = ' ';
+        }
+        if (value.size() > 300)
+        {
+            value.resize(300);
+            value += "...";
+        }
+        char line[OUT_DEBUG_BUF_LEN];
+        _snprintf_s(line, sizeof(line), _TRUNCATE,
+            "[Dump] %s +0x%03X str size=%llu: %s",
+            tag, (unsigned)off, (unsigned long long)value.size(), value.c_str());
+        LogLine(line);
+    }
+}
+
+static void DumpArgs(PCONTEXT ctx, const char *tag)
+{
+    OutputDebugPrintf("[Debug] %s RCX=%p RDX=%p R8=%p R9=%p RSP=%p",
+        tag, (void *)ctx->Rcx, (void *)ctx->Rdx, (void *)ctx->R8, (void *)ctx->R9, (void *)ctx->Rsp);
+    for (int i = 5; i <= 8; i++)
+        OutputDebugPrintf("[Debug] %s arg%d=%p", tag, i, (void *)GetArgValue(ctx, i));
+    uint8_t *sp = (uint8_t *)ctx->Rsp;
+    if (IsMemoryReadable(sp + 0x20, 16))
+    {
+        OutputDebugPrintf("[Debug] %s [rsp+20] %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
+            tag,
+            sp[0x20], sp[0x21], sp[0x22], sp[0x23], sp[0x24], sp[0x25], sp[0x26], sp[0x27],
+            sp[0x28], sp[0x29], sp[0x2A], sp[0x2B], sp[0x2C], sp[0x2D], sp[0x2E], sp[0x2F]);
+    }
+}
+
+static void ForceAllowNewId(PCONTEXT ctx, int bool_index)
+{
+    if (bool_index > 0)
+        SetArgValue(ctx, bool_index, 1);
+    uint8_t *sp = (uint8_t *)ctx->Rsp;
+    if (IsMemoryReadable(sp + 0x20, 1))
+        sp[0x20] = 1;
+}
+
+static StdString *FindRevokePayload(uint64_t base, size_t scan_range)
+{
+    static const uint8_t kYiTiao[] = { 0xe4, 0xb8, 0x80, 0xe6, 0x9d, 0xa1 }; // 一条
+    static const uint8_t kCheHui[] = { 0xe6, 0x92, 0xa4, 0xe5, 0x9b, 0x9e }; // 撤回
+    static const uint8_t kRecalled[] = { 0x72, 0x65, 0x63, 0x61, 0x6c, 0x6c, 0x65, 0x64 };
+    static const uint8_t kRevokeMsg[] = { 'r','e','v','o','k','e','m','s','g' };
+    static const uint8_t kReplaceMsg[] = { 'r','e','p','l','a','c','e','m','s','g' };
+    StdString *found = FindStdStringWithSig(base, scan_range, kYiTiao, sizeof(kYiTiao));
+    if (found == nullptr)
+        found = FindStdStringWithSig(base, scan_range, kCheHui, sizeof(kCheHui));
+    if (found == nullptr)
+        found = FindStdStringWithSig(base, scan_range, kRecalled, sizeof(kRecalled));
+    if (found == nullptr)
+        found = FindStdStringWithSig(base, scan_range, kRevokeMsg, sizeof(kRevokeMsg));
+    if (found == nullptr)
+        found = FindStdStringWithSig(base, scan_range, kReplaceMsg, sizeof(kReplaceMsg));
+    return found;
+}
+
+static uint8_t *PeSection(HMODULE mod, const char *name, size_t *out_size)
+{
+    auto *dos = (IMAGE_DOS_HEADER *)mod;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE)
+        return nullptr;
+    auto *nt = (IMAGE_NT_HEADERS64 *)((uint8_t *)mod + dos->e_lfanew);
+    auto *sec = IMAGE_FIRST_SECTION(nt);
+    size_t nlen = strlen(name);
+    for (unsigned i = 0; i < nt->FileHeader.NumberOfSections; i++)
+    {
+        if (memcmp(sec[i].Name, name, nlen) == 0)
+        {
+            if (out_size)
+                *out_size = sec[i].Misc.VirtualSize;
+            return (uint8_t *)mod + sec[i].VirtualAddress;
+        }
+    }
+    return nullptr;
+}
+
+// Add2DBOffset 落在 wrapper 里的 call CoAddMessageToDB 上。wrapper 的唯一调用方
+// 在该 call 返回后会再 call 一次 UI notify。把 notify 的 rdx 换成 tip 对象，
+// 当前会话才会立刻插入提示气泡。
+static void *DiscoverNotifyCall(uint8_t *img, uint64_t add2db_offset)
+{
+    uint8_t *inner_call = img + add2db_offset;
+    if (!IsMemoryReadable(inner_call, 16) || inner_call[0] != 0xE8)
+        return nullptr;
+
+    uint8_t *wrap = nullptr;
+    for (int i = 8; i < 48; i++)
+    {
+        uint8_t *p = inner_call - i;
+        if (!IsMemoryReadable(p, 4))
+            break;
+        if (p[0] == 0x56 && p[1] == 0x48 && p[2] == 0x83 && p[3] == 0xEC)
+        {
+            wrap = p;
+            break;
+        }
+    }
+    if (wrap == nullptr)
+        return nullptr;
+
+    size_t text_size = 0;
+    uint8_t *text = PeSection((HMODULE)img, ".text", &text_size);
+    if (text == nullptr || text_size < 8)
+        return nullptr;
+
+    const uint64_t wrap_addr = (uint64_t)wrap;
+    for (size_t i = 0; i + 5 < text_size; i++)
+    {
+        if (text[i] != 0xE8)
+            continue;
+        int32_t rel = 0;
+        memcpy(&rel, text + i + 1, 4);
+        uint64_t src = (uint64_t)(text + i);
+        if (src + 5 + (int64_t)rel != wrap_addr)
+            continue;
+
+        uint8_t *p = text + i + 5;
+        uint8_t *end = p + 32;
+        while (p < end && IsMemoryReadable(p, 5))
+        {
+            if (*p == 0x90 || *p == 0xCC)
+            {
+                p++;
+                continue;
+            }
+            if (*p == 0xE8)
+                return p;
+            if (p[0] == 0x48 && p[1] == 0x8D)
+            {
+                p += 4;
+                continue;
+            }
+            if ((p[0] == 0x48 || p[0] == 0x4C || p[0] == 0x4D) && p[1] == 0x89)
+            {
+                p += 3;
+                continue;
+            }
+            p++;
+        }
+        break;
+    }
+    return nullptr;
+}
+
+
+static uint8_t *FindWrapper(uint8_t *inner_call)
+{
+    if (!IsMemoryReadable(inner_call, 16) || inner_call[0] != 0xE8)
+        return nullptr;
+    for (int i = 8; i < 48; i++)
+    {
+        uint8_t *p = inner_call - i;
+        if (!IsMemoryReadable(p, 4))
+            break;
+        if (p[0] == 0x56 && p[1] == 0x48 && p[2] == 0x83 && p[3] == 0xEC)
+            return p;
+    }
+    return nullptr;
+}
+
+static uint8_t *NextDirectCall(uint8_t *p, uint8_t *end)
+{
+    while (p < end && IsMemoryReadable(p, 5))
+    {
+        if (*p == 0x90 || *p == 0xCC)
+        {
+            p++;
+            continue;
+        }
+        if (*p == 0xE8)
+            return p;
+        if (p[0] == 0x48 && p[1] == 0x8D)
+        {
+            p += 4;
+            continue;
+        }
+        if ((p[0] == 0x48 || p[0] == 0x4C || p[0] == 0x4D) && p[1] == 0x89)
+        {
+            p += 3;
+            continue;
+        }
+        p++;
+    }
+    return nullptr;
+}
+
+// CoReplace 在 Add2DB wrapper-caller 返回后会把 [rbp+0x580] 拷回 [rbp+0x2a0]。
+// 若 0x1693B30 抽取被跳过，这次拷贝会覆盖已经打好自定义 tip 的消息对象。
+static int DiscoverPostAddCopies(uint8_t *img, uint64_t add2db_offset, void **out, int max_out)
+{
+    uint8_t *wrap = FindWrapper(img + add2db_offset);
+    if (wrap == nullptr || max_out <= 0)
+        return 0;
+
+    size_t text_size = 0;
+    uint8_t *text = PeSection((HMODULE)img, ".text", &text_size);
+    if (text == nullptr || text_size < 16)
+        return 0;
+
+    const uint64_t wrap_addr = (uint64_t)wrap;
+    uint8_t *wrap_call = nullptr;
+    for (size_t i = 0; i + 5 < text_size; i++)
+    {
+        if (text[i] != 0xE8)
+            continue;
+        int32_t rel = 0;
+        memcpy(&rel, text + i + 1, 4);
+        if ((uint64_t)(text + i) + 5 + (int64_t)rel != wrap_addr)
+            continue;
+        wrap_call = text + i;
+        break;
+    }
+    if (wrap_call == nullptr)
+        return 0;
+
+    uint8_t *fn = wrap_call;
+    uint8_t *limit = text + 16;
+    while (fn > limit)
+    {
+        if (fn[0] == 0x55 && fn[-1] == 0xCC)
+            break;
+        fn--;
+    }
+    if (fn[0] != 0x55)
+        return 0;
+
+    const uint64_t fn_addr = (uint64_t)fn;
+    int n = 0;
+    for (size_t i = 0; i + 5 < text_size && n < max_out; i++)
+    {
+        if (text[i] != 0xE8)
+            continue;
+        int32_t rel = 0;
+        memcpy(&rel, text + i + 1, 4);
+        if ((uint64_t)(text + i) + 5 + (int64_t)rel != fn_addr)
+            continue;
+        uint8_t *next = NextDirectCall(text + i + 5, text + i + 5 + 48);
+        if (next != nullptr)
+            out[n++] = next;
+    }
+    return n;
+}
+
+
+static void DiscoverInnerDbCalls(uint8_t *img, uint64_t delmsg_offset,
+    void **out_del, void **out_check)
+{
+    *out_del = nullptr;
+    *out_check = nullptr;
+    uint8_t *site = img + delmsg_offset;
+    if (!IsMemoryReadable(site, 5) || site[0] != 0xE8)
+        return;
+    int32_t rel = 0;
+    memcpy(&rel, site + 1, 4);
+    uint8_t *del_fn = site + 5 + rel;
+
+    uint8_t *inner_fn = nullptr;
+    for (int i = 0; i + 9 < 0x140; i++)
+    {
+        uint8_t *p = del_fn + i;
+        if (!IsMemoryReadable(p, 9))
+            break;
+        if (p[0] == 0x41 && p[1] == 0x89 && p[2] == 0xD9 && p[3] == 0xE8)
+        {
+            memcpy(&rel, p + 4, 4);
+            inner_fn = p + 8 + rel;
+            break;
+        }
+    }
+    if (inner_fn == nullptr)
+        return;
+
+    for (int i = 0; i + 12 < 0x900; i++)
+    {
+        uint8_t *p = inner_fn + i;
+        if (!IsMemoryReadable(p, 12))
+            break;
+        if (!(p[0] == 0x48 && p[1] == 0x8B && p[2] == 0x8E &&
+              p[3] == 0x00 && p[4] == 0x0C && p[5] == 0x00 && p[6] == 0x00))
+            continue;
+        uint8_t *q = p + 7;
+        uint8_t *end = p + 48;
+        uint8_t *first_e8 = nullptr;
+        while (q < end && IsMemoryReadable(q, 5))
+        {
+            if (*q == 0xE8)
+            {
+                if (first_e8 == nullptr)
+                {
+                    first_e8 = q;
+                    q += 5;
+                    continue;
+                }
+                *out_del = first_e8;
+                *out_check = q;
+                return;
+            }
+            q++;
+        }
+        break;
+    }
+}
+
+static uint64_t FindSrvId(uint64_t base_addr, size_t scan_limit)
+{
+    for (size_t offset = 0; offset + 16 <= scan_limit; offset += 8)
+    {
+        uint8_t* candidate = (uint8_t*)(base_addr + offset);
+        if (!IsMemoryReadable(candidate, 16))
+            break;
+
+        if (candidate[14] != 0x00 || candidate[15] != 0x00)
+            continue;
+        if (candidate[12] == 0x00 && candidate[13] == 0x00)
+            continue;
+
+        int non_zero_count = 0;
+        for (int i = 0; i < 14; i++)
+        {
+            if (candidate[i] != 0) non_zero_count++;
+        }
+        if (non_zero_count == 14)
+            return (uint64_t)candidate;
+    }
+    return 0;
+}
+
+static bool ReadMsStdString(const StdString *ss, std::string &out)
+{
+    StdString local = {};
+    if (ss == nullptr || !SafeReadBytes(ss, &local, sizeof(local)))
+        return false;
+    if (local.size < 0 || local.capability < local.size || local.capability > 0x100000)
+        return false;
+
+    size_t n = (size_t)local.size;
+    if (n > 0x10000)
+        return false;
+    const void *data = nullptr;
+    if (local.capability >= 16)
+    {
+        uint64_t ptr = 0;
+        memcpy(&ptr, local.data_ptr, 8);
+        if (ptr == 0)
+            return false;
+        data = (const void *)ptr;
+    }
+    else
+    {
+        if (n > 15)
+            return false;
+        data = local.data_ptr;
+    }
+    out.assign(n, '\0');
+    if (n > 0 && !SafeReadBytes(data, &out[0], n))
+        return false;
+    return true;
+}
+
+static bool WriteMsStdString(StdString *ss, const std::string &value)
+{
+    if (ss == nullptr || !IsMemoryReadable(ss, sizeof(StdString)))
+        return false;
+    if (ss->capability < 0 || ss->capability > 0x100000)
+        return false;
+
+    std::string fitted = value;
+    if ((int64_t)fitted.size() > ss->capability)
+        fitted = revoke_tip::fitUtf8(fitted, (size_t)ss->capability);
+    if ((int64_t)fitted.size() > ss->capability)
+        return false;
+
+    char *dest = nullptr;
+    if (ss->capability >= 16)
+    {
+        uint64_t ptr = *((uint64_t *)ss->data_ptr);
+        if (ptr == 0 || !IsMemoryReadable((void *)ptr, fitted.size() + 1))
+            return false;
+        dest = (char *)ptr;
+    }
+    else
+    {
+        dest = (char *)ss->data_ptr;
+    }
+    memcpy(dest, fitted.c_str(), fitted.size() + 1);
+    ss->size = (int64_t)fitted.size();
+    return true;
+}
+
+static void *WxMalloc(size_t n)
+{
+    HMODULE ucrt = GetModuleHandleA("ucrtbase.dll");
+    if (ucrt != nullptr)
+    {
+        auto fn = (void *(__cdecl *)(size_t))GetProcAddress(ucrt, "malloc");
+        if (fn != nullptr)
+            return fn(n);
+    }
+    return HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, n);
+}
+
+static bool WriteMsStdStringGrow(StdString *ss, const std::string &value)
+{
+    if (ss == nullptr || !IsMemoryReadable(ss, sizeof(StdString)))
+        return false;
+    if (ss->capability < 0 || ss->capability > 0x100000)
+        return false;
+
+    if ((int64_t)value.size() <= ss->capability)
+    {
+        char *dest = nullptr;
+        if (ss->capability >= 16)
+        {
+            uint64_t ptr = *((uint64_t *)ss->data_ptr);
+            if (ptr == 0 || !IsMemoryReadable((void *)ptr, value.size() + 1))
+                return false;
+            dest = (char *)ptr;
+        }
+        else
+        {
+            dest = (char *)ss->data_ptr;
+        }
+        memcpy(dest, value.c_str(), value.size() + 1);
+        ss->size = (int64_t)value.size();
+        return true;
+    }
+
+    size_t cap = value.size() + 32;
+    if (cap < 16)
+        cap = 16;
+    char *buf = (char *)WxMalloc(cap + 1);
+    if (buf == nullptr)
+        return false;
+    memcpy(buf, value.c_str(), value.size() + 1);
+    *((uint64_t *)ss->data_ptr) = (uint64_t)buf;
+    ss->size = (int64_t)value.size();
+    ss->capability = (int64_t)cap;
+    OutputDebugPrintf("[Debug] Grew std::string to size=%llu cap=%llu",
+        (unsigned long long)value.size(), (unsigned long long)cap);
+    return true;
+}
+
+static uint64_t ReadUint64At(uint64_t base, int offset)
+{
+    uint8_t *addr = (uint8_t *)(base + offset);
+    if (!IsMemoryReadable(addr, 8))
+        return 0;
+    uint64_t value = 0;
+    memcpy(&value, addr, 8);
+    if (value < 0x10000)
+        return 0;
+    return value;
+}
+
+static uint32_t FindLikelyMsgType(uint64_t base)
+{
+    static const uint32_t kTypes[] = {3, 34, 43, 47, 48, 49, 50, 62, 42, 10000, 10002, 1};
+    for (int off = 0x08; off <= 0x40; off += 4)
+    {
+        uint8_t *addr = (uint8_t *)(base + off);
+        if (!IsMemoryReadable(addr, 4))
+            break;
+        uint32_t value = 0;
+        memcpy(&value, addr, 4);
+        for (uint32_t type : kTypes)
+        {
+            if (value == type)
+                return value;
+        }
+    }
+    return 0;
+}
+
+static bool ScoreContentCandidate(const std::string &value, std::string &best)
+{
+    if (value.empty() || value.size() > 0x8000)
+        return false;
+    if (revoke_tip::looksLikeWxId(value) || revoke_tip::looksLikeRevokePayload(value))
+        return false;
+    if (value.find("<?xml") != std::string::npos || value.find("<sysmsg") != std::string::npos)
+        return false;
+    if (value.find("http://") == 0 || value.find("https://") == 0)
+        return false;
+    if (best.empty() || value.size() > best.size())
+    {
+        best = value;
+        return true;
+    }
+    return false;
+}
+
+static void CacheContentFromObject(uint64_t base, uint64_t known_srvid)
+{
+    uint64_t srvid = known_srvid;
+    if (srvid == 0 && g_config_info.add2db_info.initialized)
+        srvid = ReadUint64At(base, g_config_info.add2db_info.offset_srvid);
+    if (srvid == 0)
+    {
+        uint64_t addr = FindSrvId(base, 0x200);
+        if (addr != 0 && IsMemoryReadable((void *)addr, 8))
+            memcpy(&srvid, (void *)addr, 8);
+    }
+    if (srvid == 0)
+    {
+        static const int kOff[] = {0xF8, 0x100, 0x108, 0x110, 0x118, 0x120, 0x128, 0x130, 0x140, 0x148, 0x150};
+        for (int off : kOff)
+        {
+            srvid = ReadUint64At(base, off);
+            if (srvid != 0)
+                break;
+        }
+    }
+    if (srvid == 0)
+        return;
+
+    uint32_t msgType = FindLikelyMsgType(base);
+    std::string best;
+    size_t scan = 0x400;
+    if (g_config_info.add2db_info.initialized)
+    {
+        StdString *known = (StdString *)(base + g_config_info.add2db_info.offset_revoke_xml);
+        std::string knownStr;
+        if (ReadMsStdString(known, knownStr))
+            ScoreContentCandidate(knownStr, best);
+    }
+    for (size_t offset = 0x40; offset + sizeof(StdString) <= scan; offset += 8)
+    {
+        StdString *ss = (StdString *)(base + offset);
+        std::string value;
+        if (!ReadMsStdString(ss, value))
+            continue;
+        ScoreContentCandidate(value, best);
+    }
+    if (best.empty() && msgType != 0 && msgType != 1)
+    {
+        revoke_tip::rememberContent(srvid, revoke_tip::messageKindPlaceholder(msgType));
+        return;
+    }
+    if (best.empty())
+        return;
+    revoke_tip::rememberContent(srvid, revoke_tip::contentPreviewForReceivedMessage(msgType, best));
+}
+
+static bool LooksLikePlainText(const std::string &value)
+{
+    if (value.empty() || value.size() > 0x8000)
+        return false;
+    if (revoke_tip::looksLikeWxId(value) || revoke_tip::looksLikeRevokePayload(value))
+        return false;
+    if (value.find('<') != std::string::npos || value.find("<?xml") != std::string::npos)
+        return false;
+    for (unsigned char ch : value)
+    {
+        if (ch < 0x20)
+            return false;
+    }
+    return true;
+}
+
+static std::string PreviewFromField(const std::string &value, uint32_t msgType)
+{
+    if (value.empty())
+        return "";
+    if (LooksLikePlainText(value))
+        return revoke_tip::truncateUtf8(value, revoke_tip::kMaxContentPreviewBytes);
+    uint32_t type = msgType;
+    if (type == 0 || type == 1)
+        type = revoke_tip::guessMsgTypeFromXml(value);
+    if (type != 0 && type != 1)
+        return revoke_tip::messageKindPlaceholder(type);
+    return "";
+}
+
+static std::string CaptureOriginalText(uint64_t base)
+{
+    if (base == 0)
+        return "";
+
+    const uint32_t msgType = FindLikelyMsgType(base);
+
+    std::string at;
+    StdString *preferred = (StdString *)(base + 0x1A0);
+    if (ReadMsStdString(preferred, at) && !at.empty())
+    {
+        std::string preview = PreviewFromField(at, msgType);
+        if (!preview.empty())
+            return preview;
+    }
+
+    if (msgType != 0 && msgType != 1)
+        return revoke_tip::messageKindPlaceholder(msgType);
+
+    std::string best;
+    for (size_t off = 0; off + sizeof(StdString) <= 0x280; off += 8)
+    {
+        if (off == 0x1A0)
+            continue;
+        StdString *ss = (StdString *)(base + off);
+        std::string value;
+        if (!ReadMsStdString(ss, value) || value.empty())
+            continue;
+        std::string preview = revoke_tip::truncateUtf8(value, revoke_tip::kMaxContentPreviewBytes);
+        if (best.empty() || preview.size() > best.size())
+            best = preview;
+    }
+    return best;
+}
+
+static bool ApplyCustomTip(StdString *ss, uint64_t fallback_id = 0, const char *extra_content = nullptr)
+{
+    std::string payload;
+    if (!ReadMsStdString(ss, payload) || payload.empty())
+        return false;
+
+    const std::string display = revoke_tip::displayTipFromPayload(payload);
+    if (revoke_tip::tipIndicatesSelfRecall(display))
+        return false;
+
+    uint64_t newMsgId = revoke_tip::newMsgIdFromXml(payload);
+    if (newMsgId == 0)
+        newMsgId = fallback_id;
+    std::string content;
+    if (extra_content != nullptr && extra_content[0] != '\0')
+        content = extra_content;
+    else if (newMsgId != 0)
+        revoke_tip::tryLookupContent(newMsgId, content);
+
+    std::string rendered = revoke_tip::renderForEvent(
+        display,
+        g_tip_phrase,
+        newMsgId,
+        payload,
+        revoke_tip::currentTimeText(),
+        content);
+    if (rendered.empty() || rendered == display)
+        return false;
+
+    std::string next = revoke_tip::applyTipToPayload(payload, rendered);
+    int64_t old_cap = ss->capability;
+    if (!WriteMsStdStringGrow(ss, next))
+    {
+        next = revoke_tip::compactRevokeXml(rendered);
+        if (!WriteMsStdStringGrow(ss, next))
+        {
+            next = revoke_tip::fitTipToCapacity(payload, rendered, (size_t)ss->capability);
+            if (!WriteMsStdString(ss, next))
+                return false;
+        }
+    }
+    OutputDebugPrintf("[Debug] ApplyCustomTip display=[%s] rendered=[%s] next=%llu cap=%lld->%lld content=[%s]",
+        display.c_str(), rendered.c_str(), (unsigned long long)next.size(),
+        (long long)old_cap, (long long)ss->capability, content.c_str());
+    OutputDebugPrintf("[Debug] Custom tip applied (%llu chars, content=%s)",
+        (unsigned long long)rendered.size(), content.empty() ? "miss" : "hit");
+    return true;
+}
+
+static void OnTargetHit(PCONTEXT ctx, PEXCEPTION_RECORD /*pExc*/)
+{
+    uint64_t rip = ctx->Rip;
+    ThreadState* thread_state = GetThreadState();
+    if (thread_state == nullptr) {
+        OutputDebugString(TEXT("[RevokeHook] GetThreadState Failed!"));
+        return;
+    }
+
+    if (rip == (uint64_t)g_bpDelMsg) 
+    {
+        uint8_t revoke_sig[] = { 0xe6, 0x92, 0xa4, 0xe5, 0x9b, 0x9e }; //'撤回'
+        uint8_t self_revoke_sig[] = { 0xe4, 0xbd, 0xa0, 0xe6, 0x92, 0xa4, 0xe5, 0x9b, 0x9e }; //'你撤回'
+        uint8_t revoke_sig_english[] = { 0x72, 0x65, 0x63, 0x61, 0x6c, 0x6c, 0x65, 0x64 }; //'recalled'
+		uint8_t self_revoke_sig_english[] = { 0x59, 0x6f, 0x75, 0x20, 0x72, 0x65, 0x63, 0x61, 0x6c, 0x6c, 0x65, 0x64 }; //'You recalled'
+
+        StdString* revoke_xml = nullptr;
+
+        if (!g_config_info.delmsg_info.initialized)
+        {
+            uint64_t candidates[] = { ctx->Rdx, ctx->R8, ctx->R9 };
+            int candidate_indices[] = { 2, 3, 4 };
+
+            for (int c = 0; c < 3 && revoke_xml == nullptr; c++)
+            {
+                revoke_xml = FindStdStringWithSig(candidates[c], 0x2000,
+                    revoke_sig, sizeof(revoke_sig));
+                if (revoke_xml == nullptr)
+                {
+                    revoke_xml = FindStdStringWithSig(candidates[c], 0x2000,
+                        revoke_sig_english, sizeof(revoke_sig_english));
+                }
+                if (revoke_xml) {
+                    g_config_info.delmsg_info.arg_msg_index = candidate_indices[c];
+                    g_config_info.delmsg_info.offset_revoke_xml = (int)((uint64_t)revoke_xml - candidates[c]);
+                }
+            }
+
+            if (revoke_xml == nullptr || revoke_xml->size <= 0)
+            {
+                OutputDebugPrintf("[Debug] DelMsg: Cannot find revoke_xml in registers");
+                return;
+            }
+
+            g_config_info.delmsg_info.arg_notify_index = FindZeroArgIndex(ctx, 3, 8);
+            g_config_info.delmsg_info.initialized = true;
+            OutputDebugPrintf("[Debug] DelMsg cached: msg_idx=%d, xml_off=0x%X, notify_idx=%d",
+                g_config_info.delmsg_info.arg_msg_index,
+                g_config_info.delmsg_info.offset_revoke_xml,
+                g_config_info.delmsg_info.arg_notify_index);
+        }
+        else
+        {
+            uint64_t arg_msg = GetArgValue(ctx, g_config_info.delmsg_info.arg_msg_index);
+            revoke_xml = (StdString*)(arg_msg + g_config_info.delmsg_info.offset_revoke_xml);
+            if (!IsMemoryReadable(revoke_xml, sizeof(StdString)) || revoke_xml->size <= 0)
+            {
+                OutputDebugPrintf("[Debug] DelMsg: revoke_xml invalid (cached path)");
+                return;
+            }
+        }
+
+        uint64_t revoke_xml_str_addr = *((uint64_t*)(revoke_xml->data_ptr));
+        if (revoke_xml_str_addr == 0 || !IsMemoryReadable((void*)revoke_xml_str_addr, (size_t)revoke_xml->size))
+        {
+            OutputDebugPrintf("[Debug] DelMsg: revoke_xml str invalid");
+            return;
+        }
+
+        bool is_self = false;
+        for (int64_t i = 0; i < (int64_t)revoke_xml->size; i++)
+        {
+            bool matches_chinese =
+                i <= (int64_t)revoke_xml->size - (int64_t)sizeof(self_revoke_sig) &&
+                memcmp((void*)(revoke_xml_str_addr + i),
+                    self_revoke_sig, sizeof(self_revoke_sig)) == 0;
+            bool matches_english =
+                i <= (int64_t)revoke_xml->size - (int64_t)sizeof(self_revoke_sig_english) &&
+                memcmp((void*)(revoke_xml_str_addr + i),
+                    self_revoke_sig_english, sizeof(self_revoke_sig_english)) == 0;
+            if (matches_chinese || matches_english)
+            {
+                is_self = true;
+                break;
+            }
+        }
+
+        if (is_self && !g_anti_revoke_self_msg)
+        {
+            thread_state->anti_revoke_cur_msg = 0;
+            return;
+        }
+        if (is_self)
+            OutputDebugPrintf("[Debug] Anti Revoke SELF Msg...");
+
+        thread_state->anti_revoke_cur_msg = 1;
+        thread_state->pending_content[0] = '\0';
+        {
+            uint64_t original_obj = GetArgValue(ctx, g_config_info.delmsg_info.arg_msg_index);
+            std::string original = CaptureOriginalText(original_obj);
+            std::string payload;
+            uint64_t nid = 0;
+            if (ReadMsStdString(revoke_xml, payload))
+                nid = revoke_tip::newMsgIdFromXml(payload);
+            if (original.empty())
+            {
+                uint64_t candidates[] = { ctx->Rcx, ctx->Rdx, ctx->R8, ctx->R9, original_obj };
+                for (uint64_t candidate : candidates)
+                {
+                    if (candidate == 0 || !IsMemoryReadable((void *)candidate, 0x40))
+                        continue;
+                    CacheContentFromObject(candidate, nid);
+                }
+                if (nid != 0)
+                    revoke_tip::tryLookupContent(nid, original);
+            }
+            if (!original.empty())
+            {
+                strncpy_s(thread_state->pending_content, original.c_str(), _TRUNCATE);
+                OutputDebugPrintf("[Debug] Captured original text: [%s]", thread_state->pending_content);
+                if (nid != 0)
+                    revoke_tip::rememberContent(nid, original);
+            }
+        }
+        if (ApplyCustomTip(revoke_xml, 0, thread_state->pending_content))
+            OutputDebugPrintf("[Debug] Patched revoke xml before skip-delete");
+        if (g_config_info.delmsg_info.arg_notify_index > 0)
+        {
+            SetArgValue(ctx, g_config_info.delmsg_info.arg_notify_index, 1);
+            OutputDebugPrintf("[Debug] Set notify arg %d to 1", g_config_info.delmsg_info.arg_notify_index);
+        }
+
+        ctx->Rax = 1;
+        ctx->Rip += 5;
+        OutputDebugPrintf("[Debug] Skip Call, New RIP: %p RAX=1", ctx->Rip);
+    }
+    else if (rip == (uint64_t)g_bpAdd2DB)
+    {
+        if (thread_state->anti_revoke_cur_msg == 0)
+            return;
+
+        if (!g_config_info.add2db_info.initialized)
+        {
+            int arg_bool_index = FindZeroArgIndex(ctx, 5, 8);
+            if (arg_bool_index < 0)
+                arg_bool_index = 5;
+
+            int arg_msg_index = 3;
+            uint64_t arg_msg = 0;
+            StdString *found_xml = nullptr;
+            int candidate_indices[] = { 3, 2, 4, 1 };
+            for (int idx : candidate_indices)
+            {
+                uint64_t candidate = GetArgValue(ctx, idx);
+                if (candidate == 0 || !IsMemoryReadable((void *)candidate, 0x100))
+                    continue;
+                found_xml = FindRevokePayload(candidate, 0x1000);
+                if (found_xml != nullptr && found_xml->size > 0)
+                {
+                    arg_msg_index = idx;
+                    arg_msg = candidate;
+                    break;
+                }
+            }
+            if (found_xml == nullptr || arg_msg == 0)
+            {
+                OutputDebugPrintf("[Debug] Add2DB: Cannot find revoke_xml, still forcing allow-new-id");
+                ForceAllowNewId(ctx, arg_bool_index);
+                return;
+            }
+
+            int xml_offset = (int)((uint64_t)found_xml - arg_msg);
+            uint64_t mem_srvid_addr = FindSrvId(arg_msg, xml_offset > 0 ? (size_t)xml_offset : 0x200);
+            if (mem_srvid_addr == 0)
+            {
+                static const int kSrvOff[] = { 0x148, 0x140, 0x150, 0x108, 0x100, 0x0F8, 0x110, 0x118, 0x130, 0x160 };
+                for (int off : kSrvOff)
+                {
+                    if (IsMemoryReadable((void *)(arg_msg + off), 8) && ReadUint64At(arg_msg, off) != 0)
+                    {
+                        mem_srvid_addr = arg_msg + off;
+                        break;
+                    }
+                }
+            }
+            if (mem_srvid_addr == 0)
+            {
+                OutputDebugPrintf("[Debug] Add2DB: srvid pattern miss, default +0x148");
+                mem_srvid_addr = arg_msg + 0x148;
+                if (!IsMemoryReadable((void *)mem_srvid_addr, 8))
+                    mem_srvid_addr = 0;
+            }
+            if (mem_srvid_addr == 0)
+            {
+                OutputDebugPrintf("[Debug] Add2DB: Cannot find srvid, still applying tip");
+            }
+
+            g_config_info.add2db_info.arg_msg_index = arg_msg_index;
+            g_config_info.add2db_info.arg_bool_index = arg_bool_index;
+            g_config_info.add2db_info.offset_revoke_xml = xml_offset;
+            g_config_info.add2db_info.offset_srvid = mem_srvid_addr
+                ? (int)(mem_srvid_addr - arg_msg) : 0x148;
+            g_config_info.add2db_info.initialized = true;
+            OutputDebugPrintf("[Debug] Add2DB cached: msg_idx=%d, bool_idx=%d, xml_off=0x%X, srvid_off=0x%X",
+                g_config_info.add2db_info.arg_msg_index,
+                g_config_info.add2db_info.arg_bool_index,
+                g_config_info.add2db_info.offset_revoke_xml,
+                g_config_info.add2db_info.offset_srvid);
+        }
+
+        int arg_bool_index = g_config_info.add2db_info.arg_bool_index > 0
+            ? g_config_info.add2db_info.arg_bool_index : 5;
+        int arg_msg_index = g_config_info.add2db_info.arg_msg_index > 0
+            ? g_config_info.add2db_info.arg_msg_index : 3;
+        uint64_t arg_msg = GetArgValue(ctx, arg_msg_index);
+        if (arg_msg == 0 || !IsMemoryReadable((void *)arg_msg, 0x100))
+        {
+            OutputDebugPrintf("[Debug] Add2DB: arg_msg invalid");
+            ForceAllowNewId(ctx, arg_bool_index);
+            return;
+        }
+
+        StdString *revoke_xml = (StdString *)(arg_msg + g_config_info.add2db_info.offset_revoke_xml);
+        if (!IsMemoryReadable(revoke_xml, sizeof(StdString)) || revoke_xml->size <= 0)
+        {
+            OutputDebugPrintf("[Debug] Add2DB: revoke_xml invalid");
+            ForceAllowNewId(ctx, arg_bool_index);
+            return;
+        }
+
+        uint64_t mem_srvid_addr = arg_msg + g_config_info.add2db_info.offset_srvid;
+        uint64_t revoke_xml_str_addr = *((uint64_t *)(revoke_xml->data_ptr));
+        OutputDebugPrintf("[Debug] %p | Revoke XML: %s | bool_idx: %d",
+            revoke_xml, (char *)revoke_xml_str_addr, arg_bool_index);
+
+        uint8_t org_srvid[8] = { 0 };
+        memcpy(org_srvid, (void *)mem_srvid_addr, 8);
+        OutputDebugPrintf("[Debug] Org srvid: %p | Last srvid: %p",
+            *((uint64_t *)org_srvid), *((uint64_t *)thread_state->last_org_srvid));
+        if (memcmp(thread_state->last_org_srvid, org_srvid, 8) == 0)
+        {
+            ForceAllowNewId(ctx, arg_bool_index);
+            return;
+        }
+        memcpy(thread_state->last_org_srvid, org_srvid, 8);
+
+        std::vector<uint8_t> rand_srvid = GetUniquePositiveValue();
+        if (rand_srvid.size() != 8)
+        {
+            OutputDebugString(TEXT("[RevokeHook] GetUniquePositiveValue Err!"));
+            ForceAllowNewId(ctx, arg_bool_index);
+            return;
+        }
+        memcpy((void *)mem_srvid_addr, rand_srvid.data(), rand_srvid.size());
+        OutputDebugPrintf("[Debug] Replaced SrvID at %p", (void *)mem_srvid_addr);
+
+        if (thread_state->pending_content[0] != '\0')
+            revoke_tip::rememberContent(*((uint64_t *)org_srvid), thread_state->pending_content);
+        if (!ApplyCustomTip(revoke_xml, *((uint64_t *)org_srvid), thread_state->pending_content))
+        {
+            uint8_t anchor[] = { 0xe4, 0xb8, 0x80, 0xe6, 0x9d, 0xa1 };
+            uint8_t replace[] = { 0xe5, 0xa6, 0x82, 0xe4, 0xb8, 0x8a };
+            uint8_t anchor_english[] = { 0x61, 0x20, 0x6d, 0x65, 0x73, 0x73, 0x61, 0x67, 0x65 };
+            uint8_t replace_english[] = { 0x61, 0x62, 0x6f, 0x76, 0x65, 0x20, 0x6d, 0x73, 0x67 };
+            for (int64_t i = 0; i < (int64_t)revoke_xml->size; i++)
+            {
+                if (i <= (int64_t)revoke_xml->size - (int64_t)sizeof(anchor) &&
+                    memcmp((void *)(revoke_xml_str_addr + i), anchor, sizeof(anchor)) == 0)
+                {
+                    memcpy((void *)(revoke_xml_str_addr + i), replace, sizeof(replace));
+                    OutputDebugPrintf("[Debug] Replace Revoke XML Success!");
+                    break;
+                }
+                if (i <= (int64_t)revoke_xml->size - (int64_t)sizeof(anchor_english) &&
+                    memcmp((void *)(revoke_xml_str_addr + i), anchor_english, sizeof(anchor_english)) == 0)
+                {
+                    memcpy((void *)(revoke_xml_str_addr + i), replace_english, sizeof(replace_english));
+                    break;
+                }
+            }
+        }
+
+        ForceAllowNewId(ctx, arg_bool_index);
+        OutputDebugPrintf("[Debug] Forced allow-new-id bool_idx=%d", arg_bool_index);
+    }
+}
+
+void InitLog()
+{
+    if (g_hLogFile != INVALID_HANDLE_VALUE)
+        return;
+
+    char tempPath[MAX_PATH] = { 0 };
+    if (GetTempPathA(MAX_PATH, tempPath) == 0)
+    {
+        OutputDebugStringA("[RevokeHook] GetTempPath For Log Failed!");
+        return;
+    }
+
+    std::string logPath = std::string(tempPath) + "RevokeHook.log";
+
+    g_hLogFile = CreateFileA(
+        logPath.c_str(),
+        GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE, // 允许其他程序打开
+        nullptr,
+        CREATE_ALWAYS,                    // 每次打开时清空旧日志
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr
+    );
+
+    if (g_hLogFile == INVALID_HANDLE_VALUE)
+    {
+        OutputDebugStringA("[RevokeHook] CreateFile Log Failed!");
+    }
+}
+
+BOOL APIENTRY DllMain( HMODULE hModule,
+                       DWORD  ul_reason_for_call,
+                       LPVOID lpReserved
+                     )
+{
+    switch (ul_reason_for_call)
+    {
+    case DLL_PROCESS_ATTACH:
+        if (!InitThreadStateTls()) {
+            OutputDebugString(TEXT("[RevokeHook] InitThreadStateTls Failed!"));
+            break;
+        }
+
+        OutputDebugString(TEXT("[RevokeHook] Reading Config..."));
+        if (!ReadExternalConfig((char*)lpReserved)) break;   //ini路径通过第三个参数传进来
+        OutputDebugString(TEXT("[RevokeHook] Begin Install VEH & Set Bp!"));
+
+        if (g_output_debeug_msg) InitLog(); // 初始化日志文件
+
+        if (g_block_update)
+        {
+            InterlockedExchange(&g_stopUpdateBlocker, 0);
+            HANDLE th = CreateThread(nullptr, 0, UpdateBlockerThread, nullptr, 0, nullptr);
+            if (th != nullptr)
+            {
+                CloseHandle(th);
+                OutputDebugPrintf("[RevokeHook] Update blocker started");
+            }
+        }
+
+        if (!VehBp_Init(TRUE))
+        {
+            OutputDebugString(_T("[RevokeHook] VEHBp Init failed!"));
+            return TRUE;
+        }
+
+		g_bpDelMsg = (void*)(g_config_info.basic_info.imgbase + g_config_info.basic_info.delmsg_offset);
+        g_bpAdd2DB = (void*)(g_config_info.basic_info.imgbase + g_config_info.basic_info.add2db_offset);
+
+        if (VehBp_Set(g_bpDelMsg, OnTargetHit) == -1)
+            OutputDebugPrintf("[RevokeHook] AddBp %p Error", g_bpDelMsg);
+        else
+            OutputDebugPrintf("[RevokeHook] AddBp %p OK", g_bpDelMsg);
+
+        if (VehBp_Set(g_bpAdd2DB, OnTargetHit) == -1)
+            OutputDebugPrintf("[RevokeHook] AddBp %p Error", g_bpAdd2DB);
+        else
+            OutputDebugPrintf("[RevokeHook] AddBp %p OK", g_bpAdd2DB);
+
+        break;
+    case DLL_THREAD_ATTACH:
+    case DLL_THREAD_DETACH:
+        break;
+    case DLL_PROCESS_DETACH:
+        InterlockedExchange(&g_stopUpdateBlocker, 1);
+        OutputDebugString(TEXT("[RevokeHook] Uninstall VEH & Cancel Bp!"));
+        VehBp_Uninit();
+        FreeCurrentThreadState();
+        UninitThreadStateTls();
+        if (g_hLogFile != INVALID_HANDLE_VALUE)
+        {
+            CloseHandle(g_hLogFile);
+            g_hLogFile = INVALID_HANDLE_VALUE;
+		}
+        break;
+    }
+    return TRUE;
+}
+
+

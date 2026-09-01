@@ -1,0 +1,17 @@
+# WeChat 4 Windows anti-recall
+# Click WeChatAntiRecall.exe: start WeChat, wait for login, inject hook.
+
+# Custom revoke tip. Placeholders: {from} {time} {content}
+tip_phrase: "已拦截 {from} 于 {time} 撤回：{content}"
+
+# Also intercept your own recalls
+anti_revoke_self: true
+
+# Kill WeixinUpdate.exe while WeChat is running, and try to disable the updater binary
+block_update: true
+
+# Bottom-right popup after inject finishes
+notify: false
+
+# Write RevokeHook.log under %TEMP%
+debug: true

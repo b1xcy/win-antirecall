@@ -1,0 +1,9 @@
+**/bin/
+**/obj/
+**/x64/
+dist/
+native/*.obj
+native/*.exe
+native/*.pdb
+*.user
+.vs/
