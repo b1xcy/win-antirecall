@@ -14,9 +14,6 @@
     <ClInclude Include="framework.h">
       <Filter>头文件</Filter>
     </ClInclude>
-    <ClInclude Include="inicpp.h">
-      <Filter>头文件</Filter>
-    </ClInclude>
     <ClInclude Include="vehbp.h">
       <Filter>头文件</Filter>
     </ClInclude>

@@ -5,18 +5,16 @@
 #include <cstdint>
 #include <string>
 #include <vector>
-#include <chrono>  
+#include <chrono>
 #include <random>
 #include <algorithm>
 #include <cctype>
-
+#include <cstdio>
+#include <wchar.h>
+#include <fstream>
 #include "vehbp.h"
 #include "revoke_tip.h"
-#include <sys/stat.h>
-#include <TlHelp32.h>
-
-//用于读取ini配置
-#include "inicpp.h" 
+#include <TlHelp32.h> 
 
 //用于计算MD5
 #pragma comment(lib, "crypt32.lib")
@@ -132,13 +130,26 @@ struct StdString
     int64_t capability;
 };
 
-ini::IniFile g_config;      //ini配置
-
 bool g_anti_revoke_self_msg = false; //是否防止自己撤回消息
 bool g_output_debeug_msg = false; //是否输出调试信息
 std::string g_tip_phrase = revoke_tip::kDefaultPhrase;
 bool g_block_update = false;
 static volatile LONG g_stopUpdateBlocker = 0;
+
+static wchar_t g_selfDir[MAX_PATH] = {};
+
+// 启动器 CreateFileMapping 写入，DLL 在 DllMain 里读完即可；名称与 C# Injector 约定一致。
+static const wchar_t kRuntimeMapName[] = L"Local\\WeChatAntiRecall.Runtime.v1";
+static const uint32_t kRuntimeMagic = 0x31524857u; // WHR1
+
+#pragma pack(push, 1)
+struct RuntimeOffsets
+{
+    uint32_t magic;
+    int32_t del_msg_offset;
+    int32_t add2db_offset;
+};
+#pragma pack(pop)
 
 #define OUT_DEBUG_BUF_LEN   1024
 
@@ -261,35 +272,121 @@ std::vector<uint8_t> GetUniquePositiveValue()
     return md5Result;
 }
 
-static bool FileExistsA(const char *path)
+static bool InitSelfDir()
 {
-    struct stat buffer;
-    return path != nullptr && path[0] != '\0' && stat(path, &buffer) == 0;
+    if (g_selfDir[0] != L'\0')
+        return true;
+
+    HMODULE self = NULL;
+    if (!GetModuleHandleExA(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            (LPCSTR)&InitSelfDir, &self))
+        return false;
+
+    wchar_t mod[MAX_PATH] = {};
+    DWORD n = GetModuleFileNameW(self, mod, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH)
+        return false;
+
+    wchar_t *slash = wcsrchr(mod, L'\\');
+    wchar_t *slashFwd = wcsrchr(mod, L'/');
+    if (slashFwd != nullptr && (slash == nullptr || slashFwd > slash))
+        slash = slashFwd;
+    if (slash == nullptr)
+        return false;
+
+    *slash = L'\0';
+    wcsncpy_s(g_selfDir, mod, _TRUNCATE);
+    return g_selfDir[0] != L'\0';
 }
 
-static std::string FindIniPath(char *lpReserved)
+static std::string TrimCopy(const std::string &s)
 {
-    if (lpReserved != nullptr && FileExistsA(lpReserved))
-        return lpReserved;
+    size_t begin = s.find_first_not_of(" \t\r\n");
+    if (begin == std::string::npos)
+        return std::string();
+    size_t end = s.find_last_not_of(" \t\r\n");
+    return s.substr(begin, end - begin + 1);
+}
 
-    char mod[MAX_PATH] = { 0 };
-    HMODULE self = NULL;
-    if (GetModuleHandleExA(
-            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-            (LPCSTR)&FindIniPath, &self)
-        && GetModuleFileNameA(self, mod, MAX_PATH) > 0)
+static std::string UnquoteYaml(std::string v)
+{
+    v = TrimCopy(v);
+    if (v.size() >= 2 && ((v.front() == '"' && v.back() == '"') || (v.front() == '\'' && v.back() == '\'')))
+        v = v.substr(1, v.size() - 2);
+    return v;
+}
+
+static bool ParseYamlBool(const std::string &value)
+{
+    return value == "1" || value == "true" || value == "True" || value == "TRUE"
+        || value == "yes" || value == "Yes" || value == "on" || value == "ON";
+}
+
+static bool LoadYamlSettings(const wchar_t *path)
+{
+    std::ifstream in(path);
+    if (!in)
+        return false;
+
+    std::string line;
+    while (std::getline(in, line))
     {
-        std::string dir = mod;
-        size_t slash = dir.find_last_of("\\/");
-        if (slash != std::string::npos)
+        if (!line.empty() && line.back() == '\r')
+            line.pop_back();
+        std::string trimmed = TrimCopy(line);
+        if (trimmed.empty() || trimmed[0] == '#' || trimmed[0] == ';')
+            continue;
+
+        size_t colon = trimmed.find(':');
+        if (colon == std::string::npos || colon == 0)
+            continue;
+
+        std::string key = TrimCopy(trimmed.substr(0, colon));
+        std::string val = UnquoteYaml(trimmed.substr(colon + 1));
+        if (key == "tip_phrase")
         {
-            std::string cand = dir.substr(0, slash) + "\\RevokeHook.ini";
-            if (FileExistsA(cand.c_str()))
-                return cand;
+            if (!val.empty())
+                g_tip_phrase = revoke_tip::sanitizedPhrase(val);
+        }
+        else if (key == "anti_revoke_self")
+        {
+            g_anti_revoke_self_msg = ParseYamlBool(val);
+        }
+        else if (key == "block_update")
+        {
+            g_block_update = ParseYamlBool(val);
+        }
+        else if (key == "debug")
+        {
+            g_output_debeug_msg = ParseYamlBool(val);
         }
     }
+    return true;
+}
 
-    return std::string();
+static bool LoadRuntimeOffsets()
+{
+    HANDLE map = OpenFileMappingW(FILE_MAP_READ, FALSE, kRuntimeMapName);
+    if (map == nullptr)
+        return false;
+
+    auto *view = reinterpret_cast<RuntimeOffsets *>(
+        MapViewOfFile(map, FILE_MAP_READ, 0, 0, sizeof(RuntimeOffsets)));
+    bool ok = false;
+    if (view != nullptr
+        && view->magic == kRuntimeMagic
+        && view->del_msg_offset != 0
+        && view->add2db_offset != 0)
+    {
+        g_config_info.basic_info.delmsg_offset = (uint32_t)view->del_msg_offset;
+        g_config_info.basic_info.add2db_offset = (uint32_t)view->add2db_offset;
+        ok = true;
+    }
+    if (view != nullptr)
+        UnmapViewOfFile(view);
+    CloseHandle(map);
+    return ok;
 }
 
 static void KillWeixinUpdateOnce()
@@ -327,19 +424,35 @@ static DWORD WINAPI UpdateBlockerThread(LPVOID)
     return 0;
 }
 
+void InitLog();
+
 /**
- * @brief 读取配置信息.
+ * @brief 读取 DLL 同目录 config.yml，并从启动器共享内存取偏移.
  */
-bool ReadExternalConfig(char* ini_path)
+bool ReadExternalConfig()
 {
-    std::string ini_path_str = FindIniPath(ini_path);
-    if (ini_path_str.empty())
+    if (!InitSelfDir())
     {
-        OutputDebugString(TEXT("[RevokeHook] Not Find ini file!"));
+        OutputDebugStringA("[RevokeHook] Get module directory failed");
         return false;
     }
 
-    g_config.load(ini_path_str);
+    wchar_t yml[MAX_PATH] = {};
+    _snwprintf_s(yml, _TRUNCATE, L"%s\\config.yml", g_selfDir);
+    if (!LoadYamlSettings(yml))
+    {
+        OutputDebugStringA("[RevokeHook] Not Find config.yml!");
+        return false;
+    }
+
+    if (g_output_debeug_msg)
+        InitLog();
+
+    if (!LoadRuntimeOffsets())
+    {
+        OutputDebugStringA("[RevokeHook] Runtime offsets mapping missing!");
+        return false;
+    }
 
     HMODULE weixin_dll_base = NULL;
     //加载当前dll的时候 Weixin.dll很可能还没有被加载
@@ -356,20 +469,11 @@ bool ReadExternalConfig(char* ini_path)
 	}
 
 	g_config_info.basic_info.imgbase = (uint64_t)weixin_dll_base;
-	g_config_info.basic_info.delmsg_offset = g_config["KeyFunc"]["DelMsgOffset"].as<int>();
-	g_config_info.basic_info.add2db_offset = g_config["KeyFunc"]["Add2DBOffset"].as<int>();
 
-	g_anti_revoke_self_msg = g_config["Setting"]["AntiRevokeSelf"].as<bool>();
-	g_output_debeug_msg = g_config["Setting"]["OutputDebugMsg"].as<bool>();
-		g_tip_phrase = revoke_tip::sanitizedPhrase(g_config["Setting"]["TipPhrase"].as<std::string>());
-    {
-        std::string block = g_config["Setting"]["BlockUpdate"].as<std::string>();
-        for (auto &ch : block)
-            ch = (char)toupper((unsigned char)ch);
-        g_block_update = (block == "TRUE" || block == "1");
-    }
-
-    OutputDebugPrintf("[RevokeHook] Use ini: %s", ini_path_str.c_str());
+    OutputDebugPrintf("[RevokeHook] Use config: %ls  DelMsg=0x%X Add2DB=0x%X",
+        yml,
+        (unsigned)g_config_info.basic_info.delmsg_offset,
+        (unsigned)g_config_info.basic_info.add2db_offset);
     return true;
 }
 
@@ -536,6 +640,35 @@ static int FindZeroArgIndex(PCONTEXT ctx, int start_idx, int end_idx)
 
 static bool ReadMsStdString(const StdString *ss, std::string &out);
 
+static const char *ClassifyDumpString(const std::string &value)
+{
+    if (revoke_tip::looksLikeMsgSource(value))
+        return "msgsource";
+    if (revoke_tip::looksLikeWxId(value))
+        return "wxid";
+    if (revoke_tip::looksLikeRevokePayload(value))
+        return "revoke";
+    if (value.find("<?xml") != std::string::npos || value.find("<sysmsg") != std::string::npos)
+        return "xml";
+    if (value.find('<') != std::string::npos)
+        return "xml";
+    return "plain";
+}
+
+static void SanitizeDumpValue(std::string &value)
+{
+    for (char &ch : value)
+    {
+        if (ch == '\n' || ch == '\r' || ch == '\t')
+            ch = ' ';
+    }
+    if (value.size() > 300)
+    {
+        value.resize(300);
+        value += "...";
+    }
+}
+
 static void DumpObjectStrings(uint64_t base, size_t range, const char *tag)
 {
     if (!g_output_debeug_msg)
@@ -543,28 +676,88 @@ static void DumpObjectStrings(uint64_t base, size_t range, const char *tag)
     if (base == 0 || range < sizeof(StdString) || !IsMemoryReadable((void *)base, 16))
         return;
     OutputDebugPrintf("[Dump] %s base=%p range=0x%X", tag, (void *)base, (unsigned)range);
+
+    static const uint32_t kMsgTypes[] = {1, 3, 34, 42, 43, 47, 48, 49, 50, 62, 10000, 10002};
+    for (int off = 0x00; off <= 0x80; off += 4)
+    {
+        uint32_t value = 0;
+        if (!SafeReadBytes((void *)(base + off), &value, 4))
+            break;
+        for (uint32_t type : kMsgTypes)
+        {
+            if (value == type)
+            {
+                OutputDebugPrintf("[Dump] %s +0x%02X u32=%u", tag, off, value);
+                break;
+            }
+        }
+    }
+
     for (size_t off = 0; off + sizeof(StdString) <= range; off += 8)
     {
         std::string value;
         StdString *ss = (StdString *)(base + off);
         if (!ReadMsStdString(ss, value) || value.empty())
             continue;
-        for (char &ch : value)
-        {
-            if (ch == '\n' || ch == '\r' || ch == '\t')
-                ch = ' ';
-        }
-        if (value.size() > 300)
-        {
-            value.resize(300);
-            value += "...";
-        }
+        const char *kind = ClassifyDumpString(value);
+        int64_t cap = ss->capability;
+        SanitizeDumpValue(value);
         char line[OUT_DEBUG_BUF_LEN];
         _snprintf_s(line, sizeof(line), _TRUNCATE,
-            "[Dump] %s +0x%03X str size=%llu: %s",
-            tag, (unsigned)off, (unsigned long long)value.size(), value.c_str());
+            "[Dump] %s +0x%03X str size=%llu cap=%lld class=%s: %s",
+            tag, (unsigned)off, (unsigned long long)ss->size, (long long)cap, kind, value.c_str());
         LogLine(line);
     }
+}
+
+static bool LooksLikeHeapObject(uint64_t ptr)
+{
+    if (ptr < 0x10000 || ptr > 0x00007FFFFFFFFFFFULL)
+        return false;
+    if ((ptr & 7) != 0)
+        return false;
+    uint64_t img = g_config_info.basic_info.imgbase;
+    if (img != 0 && ptr >= img && ptr < img + 0x5000000ULL)
+        return false;
+    return IsMemoryReadable((void *)ptr, 0x80);
+}
+
+static void DumpObjectDeep(uint64_t base, const char *tag)
+{
+    DumpObjectStrings(base, 0x500, tag);
+    int nested = 0;
+    for (size_t off = 0; off + 8 <= 0x200 && nested < 6; off += 8)
+    {
+        std::string occupied;
+        if (off + sizeof(StdString) <= 0x200 &&
+            ReadMsStdString((StdString *)(base + off), occupied) && !occupied.empty())
+        {
+            continue;
+        }
+        uint64_t child = 0;
+        if (!SafeReadBytes((void *)(base + off), &child, 8))
+            continue;
+        if (child == base || !LooksLikeHeapObject(child))
+            continue;
+        char childTag[80];
+        _snprintf_s(childTag, sizeof(childTag), _TRUNCATE, "%s+0x%03X", tag, (unsigned)off);
+        DumpObjectStrings(child, 0x400, childTag);
+        nested += 1;
+    }
+}
+
+static void DumpOneDelMsgObj(uint64_t *seen, int *nseen, int maxSeen, uint64_t ptr, const char *name)
+{
+    if (ptr == 0 || !IsMemoryReadable((void *)ptr, 0x40))
+        return;
+    for (int i = 0; i < *nseen; i++)
+    {
+        if (seen[i] == ptr)
+            return;
+    }
+    if (*nseen < maxSeen)
+        seen[(*nseen)++] = ptr;
+    DumpObjectDeep(ptr, name);
 }
 
 static void DumpArgs(PCONTEXT ctx, const char *tag)
@@ -581,6 +774,20 @@ static void DumpArgs(PCONTEXT ctx, const char *tag)
             sp[0x20], sp[0x21], sp[0x22], sp[0x23], sp[0x24], sp[0x25], sp[0x26], sp[0x27],
             sp[0x28], sp[0x29], sp[0x2A], sp[0x2B], sp[0x2C], sp[0x2D], sp[0x2E], sp[0x2F]);
     }
+}
+
+static void DumpDelMsgObjects(PCONTEXT ctx, uint64_t primary)
+{
+    if (!g_output_debeug_msg)
+        return;
+    DumpArgs(ctx, "DelMsg");
+    uint64_t seen[8] = {};
+    int nseen = 0;
+    DumpOneDelMsgObj(seen, &nseen, 8, ctx->Rcx, "DelMsg.RCX");
+    DumpOneDelMsgObj(seen, &nseen, 8, ctx->Rdx, "DelMsg.RDX");
+    DumpOneDelMsgObj(seen, &nseen, 8, ctx->R8, "DelMsg.R8");
+    DumpOneDelMsgObj(seen, &nseen, 8, ctx->R9, "DelMsg.R9");
+    DumpOneDelMsgObj(seen, &nseen, 8, primary, "DelMsg.msg");
 }
 
 static void ForceAllowNewId(PCONTEXT ctx, int bool_index)
@@ -1034,6 +1241,8 @@ static bool ScoreContentCandidate(const std::string &value, std::string &best)
         return false;
     if (revoke_tip::looksLikeWxId(value) || revoke_tip::looksLikeRevokePayload(value))
         return false;
+    if (revoke_tip::looksLikeMsgSource(value))
+        return false;
     if (value.find("<?xml") != std::string::npos || value.find("<sysmsg") != std::string::npos)
         return false;
     if (value.find("http://") == 0 || value.find("https://") == 0)
@@ -1116,7 +1325,7 @@ static bool LooksLikePlainText(const std::string &value)
 
 static std::string PreviewFromField(const std::string &value, uint32_t msgType)
 {
-    if (value.empty())
+    if (value.empty() || revoke_tip::looksLikeMsgSource(value))
         return "";
     if (LooksLikePlainText(value))
         return revoke_tip::truncateUtf8(value, revoke_tip::kMaxContentPreviewBytes);
@@ -1128,39 +1337,137 @@ static std::string PreviewFromField(const std::string &value, uint32_t msgType)
     return "";
 }
 
+struct ContentField
+{
+    size_t off;
+    std::string preview;
+    bool metadata;
+};
+
+static void CollectContentFields(uint64_t base, size_t range, uint32_t msgType,
+    std::vector<ContentField> &out, size_t *msgsourceOff)
+{
+    if (base == 0 || !IsMemoryReadable((void *)base, 16))
+        return;
+    for (size_t off = 0; off + sizeof(StdString) <= range; off += 8)
+    {
+        std::string value;
+        if (!ReadMsStdString((StdString *)(base + off), value) || value.empty())
+            continue;
+        ContentField field{};
+        field.off = off;
+        field.metadata = revoke_tip::looksLikeMsgSource(value);
+        if (field.metadata)
+        {
+            if (msgsourceOff != nullptr && *msgsourceOff == (size_t)-1)
+                *msgsourceOff = off;
+            out.push_back(std::move(field));
+            continue;
+        }
+        field.preview = PreviewFromField(value, msgType);
+        if (!field.preview.empty())
+            out.push_back(std::move(field));
+    }
+}
+
+static std::string PickContentField(const std::vector<ContentField> &fields, size_t msgsourceOff)
+{
+    auto take = [&](size_t off) -> std::string
+    {
+        for (const auto &field : fields)
+        {
+            if (field.off == off && !field.metadata && !field.preview.empty())
+            {
+                OutputDebugPrintf("[Debug] CaptureOriginalText pick +0x%X size=%llu",
+                    (unsigned)off, (unsigned long long)field.preview.size());
+                return field.preview;
+            }
+        }
+        return "";
+    };
+
+    if (msgsourceOff != (size_t)-1)
+    {
+        static const int kNeighbor[] = {-0x20, 0x20, -0x40, 0x40, -0x60, 0x60};
+        for (int delta : kNeighbor)
+        {
+            if (delta < 0 && msgsourceOff < (size_t)(-delta))
+                continue;
+            std::string picked = take(msgsourceOff + delta);
+            if (!picked.empty())
+                return picked;
+        }
+    }
+
+    static const size_t kPreferred[] = {
+        0x1A0, 0x180, 0x1C0, 0x160, 0x1E0, 0x140, 0x200, 0x220, 0x120, 0x240
+    };
+    for (size_t off : kPreferred)
+    {
+        std::string picked = take(off);
+        if (!picked.empty())
+            return picked;
+    }
+
+    std::string best;
+    size_t bestOff = 0;
+    for (const auto &field : fields)
+    {
+        if (field.metadata || field.preview.empty())
+            continue;
+        if (best.empty() || field.preview.size() > best.size())
+        {
+            best = field.preview;
+            bestOff = field.off;
+        }
+    }
+    if (!best.empty())
+    {
+        OutputDebugPrintf("[Debug] CaptureOriginalText fallback +0x%X size=%llu",
+            (unsigned)bestOff, (unsigned long long)best.size());
+    }
+    return best;
+}
+
 static std::string CaptureOriginalText(uint64_t base)
 {
     if (base == 0)
         return "";
 
     const uint32_t msgType = FindLikelyMsgType(base);
+    OutputDebugPrintf("[Debug] CaptureOriginalText base=%p type=%u", (void *)base, msgType);
 
-    std::string at;
-    StdString *preferred = (StdString *)(base + 0x1A0);
-    if (ReadMsStdString(preferred, at) && !at.empty())
+    std::vector<ContentField> fields;
+    size_t msgsourceOff = (size_t)-1;
+    CollectContentFields(base, 0x500, msgType, fields, &msgsourceOff);
+    std::string picked = PickContentField(fields, msgsourceOff);
+    if (!picked.empty())
+        return picked;
+
+    fields.clear();
+    int nested = 0;
+    for (size_t off = 0; off + 8 <= 0x200 && nested < 6; off += 8)
     {
-        std::string preview = PreviewFromField(at, msgType);
-        if (!preview.empty())
-            return preview;
+        std::string occupied;
+        if (off + sizeof(StdString) <= 0x200 &&
+            ReadMsStdString((StdString *)(base + off), occupied) && !occupied.empty())
+        {
+            continue;
+        }
+        uint64_t child = 0;
+        if (!SafeReadBytes((void *)(base + off), &child, 8))
+            continue;
+        if (child == base || !LooksLikeHeapObject(child))
+            continue;
+        CollectContentFields(child, 0x400, msgType, fields, nullptr);
+        nested += 1;
     }
-
+    picked = PickContentField(fields, (size_t)-1);
+    if (!picked.empty())
+        return picked;
     if (msgType != 0 && msgType != 1)
         return revoke_tip::messageKindPlaceholder(msgType);
-
-    std::string best;
-    for (size_t off = 0; off + sizeof(StdString) <= 0x280; off += 8)
-    {
-        if (off == 0x1A0)
-            continue;
-        StdString *ss = (StdString *)(base + off);
-        std::string value;
-        if (!ReadMsStdString(ss, value) || value.empty())
-            continue;
-        std::string preview = revoke_tip::truncateUtf8(value, revoke_tip::kMaxContentPreviewBytes);
-        if (best.empty() || preview.size() > best.size())
-            best = preview;
-    }
-    return best;
+    return "";
 }
 
 static bool ApplyCustomTip(StdString *ss, uint64_t fallback_id = 0, const char *extra_content = nullptr)
@@ -1311,13 +1618,15 @@ static void OnTargetHit(PCONTEXT ctx, PEXCEPTION_RECORD /*pExc*/)
         thread_state->pending_content[0] = '\0';
         {
             uint64_t original_obj = GetArgValue(ctx, g_config_info.delmsg_info.arg_msg_index);
+            DumpDelMsgObjects(ctx, original_obj);
             std::string original = CaptureOriginalText(original_obj);
             std::string payload;
             uint64_t nid = 0;
             if (ReadMsStdString(revoke_xml, payload))
                 nid = revoke_tip::newMsgIdFromXml(payload);
-            if (original.empty())
+            if (original.empty() || revoke_tip::looksLikeMsgSource(original))
             {
+                original.clear();
                 uint64_t candidates[] = { ctx->Rcx, ctx->Rdx, ctx->R8, ctx->R9, original_obj };
                 for (uint64_t candidate : candidates)
                 {
@@ -1327,6 +1636,8 @@ static void OnTargetHit(PCONTEXT ctx, PEXCEPTION_RECORD /*pExc*/)
                 }
                 if (nid != 0)
                     revoke_tip::tryLookupContent(nid, original);
+                if (revoke_tip::looksLikeMsgSource(original))
+                    original.clear();
             }
             if (!original.empty())
             {
@@ -1503,22 +1814,21 @@ void InitLog()
 {
     if (g_hLogFile != INVALID_HANDLE_VALUE)
         return;
-
-    char tempPath[MAX_PATH] = { 0 };
-    if (GetTempPathA(MAX_PATH, tempPath) == 0)
+    if (!InitSelfDir())
     {
-        OutputDebugStringA("[RevokeHook] GetTempPath For Log Failed!");
+        OutputDebugStringA("[RevokeHook] Get module directory for log failed!");
         return;
     }
 
-    std::string logPath = std::string(tempPath) + "RevokeHook.log";
+    wchar_t logPath[MAX_PATH] = {};
+    _snwprintf_s(logPath, _TRUNCATE, L"%s\\RevokeHook.log", g_selfDir);
 
-    g_hLogFile = CreateFileA(
-        logPath.c_str(),
+    g_hLogFile = CreateFileW(
+        logPath,
         GENERIC_WRITE,
-        FILE_SHARE_READ | FILE_SHARE_WRITE, // 允许其他程序打开
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
         nullptr,
-        CREATE_ALWAYS,                    // 每次打开时清空旧日志
+        CREATE_ALWAYS,
         FILE_ATTRIBUTE_NORMAL,
         nullptr
     );
@@ -1526,7 +1836,10 @@ void InitLog()
     if (g_hLogFile == INVALID_HANDLE_VALUE)
     {
         OutputDebugStringA("[RevokeHook] CreateFile Log Failed!");
+        return;
     }
+
+    OutputDebugPrintf("[RevokeHook] Log file: %ls", logPath);
 }
 
 BOOL APIENTRY DllMain( HMODULE hModule,
@@ -1543,7 +1856,7 @@ BOOL APIENTRY DllMain( HMODULE hModule,
         }
 
         OutputDebugString(TEXT("[RevokeHook] Reading Config..."));
-        if (!ReadExternalConfig((char*)lpReserved)) break;   //ini路径通过第三个参数传进来
+        if (!ReadExternalConfig()) break;
         OutputDebugString(TEXT("[RevokeHook] Begin Install VEH & Set Bp!"));
 
         if (g_output_debeug_msg) InitLog(); // 初始化日志文件

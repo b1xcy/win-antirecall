@@ -1,6 +1,7 @@
 using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
+using System.IO.MemoryMappedFiles;
 using System.Runtime.InteropServices;
 using System.Text;
 
@@ -8,7 +9,29 @@ namespace WeChatAntiRecall;
 
 internal static class Injector
 {
-    public static void Inject(int pid, string dllPath)
+    // Must match native/RevokeHook/RevokeHook/dllmain.cpp
+    private const string RuntimeMapName = @"Local\WeChatAntiRecall.Runtime.v1";
+    private const uint RuntimeMagic = 0x31524857; // WHR1
+    private const int RuntimePayloadSize = 12;
+
+    public static void Inject(int pid, string dllPath, int delMsgOffset, int add2DbOffset)
+    {
+        if (delMsgOffset == 0 || add2DbOffset == 0)
+        {
+            throw new InvalidOperationException($"无效偏移: DelMsg=0x{delMsgOffset:X} Add2DB=0x{add2DbOffset:X}");
+        }
+
+        using var mmf = MemoryMappedFile.CreateOrOpen(RuntimeMapName, RuntimePayloadSize);
+        using var view = mmf.CreateViewAccessor(0, RuntimePayloadSize);
+        view.Write(0, RuntimeMagic);
+        view.Write(4, delMsgOffset);
+        view.Write(8, add2DbOffset);
+        view.Flush();
+
+        InjectProcess(pid, dllPath);
+    }
+
+    private static void InjectProcess(int pid, string dllPath)
     {
         if (!File.Exists(dllPath))
         {

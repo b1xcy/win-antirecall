@@ -21,7 +21,7 @@ public partial class MainWindow : Window
             Log($"  block_update={config.BlockUpdate}  notify={config.Notify}  debug={config.Debug}");
 
             SetStatus("搜索偏移...");
-            await Task.Run(() => OffsetSearch.Run(config, Log));
+            var offsets = await Task.Run(() => OffsetSearch.Run(Log));
 
             if (config.BlockUpdate)
             {
@@ -41,7 +41,7 @@ public partial class MainWindow : Window
 
             var dllPath = Path.Combine(AppContext.BaseDirectory, "RevokeHook.dll");
             SetStatus("注入 Hook...");
-            await Task.Run(() => Injector.Inject(pid, dllPath));
+            await Task.Run(() => Injector.Inject(pid, dllPath, offsets.DelMsgOffset, offsets.Add2DbOffset));
             Log("注入完成。");
 
             SetStatus("就绪");

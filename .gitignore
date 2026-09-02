@@ -7,3 +7,5 @@ native/*.exe
 native/*.pdb
 *.user
 .vs/
+RevokeHook.log
+RevokeHook.ini

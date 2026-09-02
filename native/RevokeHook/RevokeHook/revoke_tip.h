@@ -780,6 +780,15 @@ inline bool looksLikeWxId(const std::string &value)
     return false;
 }
 
+inline bool looksLikeMsgSource(const std::string &value)
+{
+    return value.find("<msgsource") != std::string::npos ||
+           value.find("<bizflag") != std::string::npos ||
+           value.find("<membercount") != std::string::npos ||
+           value.find("<tmp_node") != std::string::npos ||
+           (value.find("<pua>") != std::string::npos && value.find("<signature>") != std::string::npos);
+}
+
 inline bool looksLikeRevokePayload(const std::string &value)
 {
     return value.find("<revokemsg") != std::string::npos ||

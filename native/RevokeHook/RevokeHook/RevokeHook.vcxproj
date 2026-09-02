@@ -140,7 +140,6 @@
   <ItemGroup>
     <ClInclude Include="vehbp.h" />
     <ClInclude Include="framework.h" />
-    <ClInclude Include="inicpp.h" />
     <ClInclude Include="revoke_tip.h" />
   </ItemGroup>
   <ItemGroup>

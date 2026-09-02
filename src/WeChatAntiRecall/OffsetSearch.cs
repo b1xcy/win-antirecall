@@ -1,15 +1,15 @@
 using System.IO;
-using WeChatAntiRecall.Models;
 using WeChatAntiRecall.Services;
 
 namespace WeChatAntiRecall;
 
+internal sealed record OffsetSearchResult(int DelMsgOffset, int Add2DbOffset, string Version);
+
 internal static class OffsetSearch
 {
-    public static RevokeHookConfig Run(AppConfig app, Action<string>? log = null)
+    public static OffsetSearchResult Run(Action<string>? log = null)
     {
         var baseDir = AppContext.BaseDirectory;
-        var iniPath = Path.Combine(baseDir, "RevokeHook.ini");
         var config3Path = Path.Combine(baseDir, "Config3.json");
 
         log?.Invoke("搜索 Weixin.dll ...");
@@ -46,17 +46,7 @@ internal static class OffsetSearch
             throw new InvalidOperationException($"搜索失败: DelMsg=0x{delOffset:X} Add2DB=0x{addOffset:X}");
         }
 
-        var config = File.Exists(iniPath) ? IniService.Load(iniPath) : new RevokeHookConfig();
-        config.KeyFunc.DelMsgOffset = unchecked((int)delOffset);
-        config.KeyFunc.Add2DBOffset = unchecked((int)addOffset);
-        config.Setting.Ver = version;
-        config.Setting.TipPhrase = app.TipPhrase;
-        config.Setting.AntiRevokeSelf = app.AntiRevokeSelf;
-        config.Setting.OutputDebugMsg = app.Debug;
-        config.Setting.BlockUpdate = app.BlockUpdate;
-        IniService.Save(iniPath, config);
-
         log?.Invoke($"DelMsgOffset=0x{delOffset:X}  Add2DBOffset=0x{addOffset:X}");
-        return config;
+        return new OffsetSearchResult(unchecked((int)delOffset), unchecked((int)addOffset), version);
     }
 }

@@ -4,7 +4,7 @@
 
 - 跳过 `DeleteMessages`，原文留在打开的会话里
 - 自定义撤回提示写入数据库，**切换会话再回来**后显示
-- `{from}` / `{time}` 来自微信撤回 XML；`{content}` 从 `DelMsg.RDX+0x1A0` 读取（长文本预览、图片显示为 `[图片]`），写入时扩容 `std::string`
+- `{from}` / `{time}` 来自微信撤回 XML；`{content}` 从 DelMsg 消息对象的 `std::string` 字段读取（群聊会跳过 `<msgsource>`，优先取它相邻的正文；长文本预览、图片显示为 `[图片]`），写入时扩容 `std::string`
 - 不修改微信磁盘上的 `Weixin.dll`
 - `Config3.json` **优先从上游云端拉取**，失败则回退随包附带的本地副本（上游不可用时仍能工作）
 
@@ -36,7 +36,7 @@ debug: true
 | `config.yml` | 用户配置 |
 | `dist/` | 发布目录 |
 
-日志：`%TEMP%\RevokeHook.log`（`debug: true` 时）。
+日志：`WeChatAntiRecall.exe` 同目录下的 `RevokeHook.log`（`debug: true` 时）。设置只读 `config.yml`，不再生成 `RevokeHook.ini`。
 
 `Config3.json` 云端地址：
 
