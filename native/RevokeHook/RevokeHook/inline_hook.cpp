@@ -10,7 +10,8 @@
 
 // 外部日志函数
 extern void OutputDebugPrintf(const char* fmt, ...);
-extern "C" void ObserveFlashWindowEx(uintptr_t return_address, const FLASHWINFO *flash_info);
+extern "C" void ObserveFlashWindowEx(uintptr_t return_address,
+    const FLASHWINFO *flash_info, uint64_t caller_rdi);
 
 // 防止频繁通知
 static DWORD g_LastNotifyTime = 0;
@@ -22,117 +23,226 @@ struct NotificationParams
     wchar_t content[512];
 };
 
+// 只保留一个待显示的通知，避免锁屏期间向 Shell 累积气泡。
+static SRWLOCK g_notificationLock = SRWLOCK_INIT;
+static NotificationParams g_pendingNotification = {};
+static bool g_pendingNotificationValid = false;
+static HANDLE g_notificationEvent = nullptr;
+static volatile LONG g_notificationWorkerRunning = 0;
+
+static bool IsWorkstationLocked()
+{
+    HDESK desktop = OpenInputDesktop(0, FALSE, DESKTOP_READOBJECTS);
+    if (!desktop)
+        return true;
+
+    wchar_t desktopName[64] = {};
+    DWORD bytes = 0;
+    const bool queried = GetUserObjectInformationW(
+        desktop, UOI_NAME, desktopName, sizeof(desktopName), &bytes) != FALSE;
+    CloseDesktop(desktop);
+    return queried && _wcsicmp(desktopName, L"Default") != 0;
+}
+
+static bool TakePendingNotification(NotificationParams &params)
+{
+    AcquireSRWLockExclusive(&g_notificationLock);
+    const bool valid = g_pendingNotificationValid;
+    if (valid)
+    {
+        params = g_pendingNotification;
+        g_pendingNotificationValid = false;
+    }
+    ReleaseSRWLockExclusive(&g_notificationLock);
+    return valid;
+}
+
+static LRESULT CALLBACK NotificationWindowProc(HWND hWnd, UINT message,
+    WPARAM wParam, LPARAM lParam)
+{
+    if (message == WM_APP + 1 &&
+        (static_cast<UINT>(lParam) == NIN_BALLOONUSERCLICK ||
+         static_cast<UINT>(LOWORD(lParam)) == NIN_BALLOONUSERCLICK))
+    {
+        ShellExecuteW(nullptr, L"open", L"weixin://", nullptr, nullptr, SW_SHOWNORMAL);
+        return 0;
+    }
+    return DefWindowProcW(hWnd, message, wParam, lParam);
+}
+
 static DWORD WINAPI NotificationThread(LPVOID param)
 {
     __try
     {
-        NotificationParams* np = (NotificationParams*)param;
+        (void)param;
 
-        OutputDebugPrintf("[Toast] Thread started: from=[%S] content=[%S]", np->from, np->content);
-
-        // 创建隐藏窗口
-        HWND hWnd = CreateWindowExW(0, L"STATIC", L"NotifyWindow", 0, 0, 0, 0, 0,
-            nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
-
-        if (!hWnd)
-        {
-            OutputDebugPrintf("[Toast] CreateWindowExW failed: %lu", GetLastError());
-            delete np;
-            return 1;
-        }
-
-        // 获取 DLL 所在目录的 IcoE.ico
-        wchar_t iconPath[MAX_PATH] = {0};
-        HMODULE hModule = nullptr;
-        if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-            (LPCWSTR)&NotificationThread, &hModule) && hModule)
-        {
-            GetModuleFileNameW(hModule, iconPath, MAX_PATH);
-            wchar_t* lastSlash = wcsrchr(iconPath, L'\\');
-            if (lastSlash)
-            {
-                wcscpy_s(lastSlash + 1, MAX_PATH - (lastSlash + 1 - iconPath), L"IcoE.ico");
-            }
-        }
-
-        // 加载图标
+        HWND hWnd = nullptr;
         HICON hIconTray = nullptr;
         HICON hIconBalloon = nullptr;
-
-        if (iconPath[0] && GetFileAttributesW(iconPath) != INVALID_FILE_ATTRIBUTES)
-        {
-            hIconTray = (HICON)LoadImageW(nullptr, iconPath, IMAGE_ICON, 16, 16, LR_LOADFROMFILE);
-            hIconBalloon = (HICON)LoadImageW(nullptr, iconPath, IMAGE_ICON, 32, 32, LR_LOADFROMFILE);
-            OutputDebugPrintf("[Toast] Loading icon from: %S", iconPath);
-        }
-
-        if (!hIconTray)
-        {
-            hIconTray = LoadIcon(nullptr, IDI_INFORMATION);
-            OutputDebugPrintf("[Toast] Using fallback tray icon");
-        }
-        if (!hIconBalloon)
-        {
-            hIconBalloon = LoadIcon(nullptr, IDI_INFORMATION);
-            OutputDebugPrintf("[Toast] Using fallback balloon icon");
-        }
-
-        // 步骤 1: NIM_ADD 添加托盘图标
         NOTIFYICONDATAW nid = {};
-        nid.cbSize = sizeof(NOTIFYICONDATAW);
-        nid.hWnd = hWnd;
-        nid.uID = 1;
-        nid.uFlags = NIF_ICON | NIF_TIP | NIF_MESSAGE;
-        nid.uCallbackMessage = WM_APP + 1;
-        nid.hIcon = hIconTray;
-        wcsncpy_s(nid.szTip, sizeof(nid.szTip) / sizeof(nid.szTip[0]), L"WeChat", _TRUNCATE);
+        bool iconAdded = false;
+        DWORD balloonEnd = 0;
 
-        if (!Shell_NotifyIconW(NIM_ADD, &nid))
+        for (;;)
         {
-            OutputDebugPrintf("[Toast] NIM_ADD failed: %lu", GetLastError());
-            DestroyWindow(hWnd);
-            delete np;
-            return 1;
+            // 锁屏时不调用 NIM_MODIFY；保留待显示的最新一条，解锁后只显示这一条。
+            if (IsWorkstationLocked())
+            {
+                if (iconAdded)
+                {
+                    Shell_NotifyIconW(NIM_DELETE, &nid);
+                    iconAdded = false;
+                }
+            }
+            else
+            {
+                NotificationParams np = {};
+                if (TakePendingNotification(np))
+                {
+                    if (iconAdded)
+                    {
+                        Shell_NotifyIconW(NIM_DELETE, &nid);
+                        iconAdded = false;
+                    }
+
+                    if (!hWnd)
+                    {
+                        OutputDebugPrintf("[Toast] Thread started: from=[%S] content=[%S]",
+                            np.from, np.content);
+
+                        // 创建隐藏窗口
+                        hWnd = CreateWindowExW(0, L"STATIC", L"NotifyWindow", 0, 0, 0, 0, 0,
+                            nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+
+                        if (!hWnd)
+                        {
+                            OutputDebugPrintf("[Toast] CreateWindowExW failed: %lu", GetLastError());
+                        }
+                        else
+                        {
+                            SetWindowLongPtrW(hWnd, GWLP_WNDPROC,
+                                reinterpret_cast<LONG_PTR>(NotificationWindowProc));
+
+                            // 获取 DLL 所在目录的 IcoE.ico
+                            wchar_t iconPath[MAX_PATH] = {0};
+                            HMODULE hModule = nullptr;
+                            if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                (LPCWSTR)&NotificationThread, &hModule) && hModule)
+                            {
+                                GetModuleFileNameW(hModule, iconPath, MAX_PATH);
+                                wchar_t* lastSlash = wcsrchr(iconPath, L'\\');
+                                if (lastSlash)
+                                {
+                                    wcscpy_s(lastSlash + 1,
+                                        MAX_PATH - (lastSlash + 1 - iconPath), L"IcoE.ico");
+                                }
+                            }
+
+                            // 加载图标
+                            if (iconPath[0] &&
+                                GetFileAttributesW(iconPath) != INVALID_FILE_ATTRIBUTES)
+                            {
+                                hIconTray = (HICON)LoadImageW(nullptr, iconPath,
+                                    IMAGE_ICON, 16, 16, LR_LOADFROMFILE);
+                                hIconBalloon = (HICON)LoadImageW(nullptr, iconPath,
+                                    IMAGE_ICON, 32, 32, LR_LOADFROMFILE);
+                                OutputDebugPrintf("[Toast] Loading icon from: %S", iconPath);
+                            }
+
+                            if (!hIconTray)
+                            {
+                                hIconTray = LoadIcon(nullptr, IDI_INFORMATION);
+                                OutputDebugPrintf("[Toast] Using fallback tray icon");
+                            }
+                            if (!hIconBalloon)
+                            {
+                                hIconBalloon = LoadIcon(nullptr, IDI_INFORMATION);
+                                OutputDebugPrintf("[Toast] Using fallback balloon icon");
+                            }
+
+                            nid.cbSize = sizeof(NOTIFYICONDATAW);
+                            nid.hWnd = hWnd;
+                            nid.uID = 1;
+                            nid.uCallbackMessage = WM_APP + 1;
+                            nid.hIcon = hIconTray;
+                            wcsncpy_s(nid.szTip, sizeof(nid.szTip) / sizeof(nid.szTip[0]),
+                                L"WeChat", _TRUNCATE);
+                        }
+                    }
+
+                    if (hWnd && hIconTray)
+                    {
+                        // 每次只保留同一个托盘图标，新的消息替换旧的气泡。
+                        nid.uFlags = NIF_ICON | NIF_TIP | NIF_MESSAGE;
+                        nid.uVersion = 0;
+                        if (Shell_NotifyIconW(NIM_ADD, &nid))
+                        {
+                            iconAdded = true;
+                            OutputDebugPrintf("[Toast] NIM_ADD success");
+
+                            nid.uVersion = NOTIFYICON_VERSION_4;
+                            if (!Shell_NotifyIconW(NIM_SETVERSION, &nid))
+                            {
+                                OutputDebugPrintf("[Toast] NIM_SETVERSION failed: %lu", GetLastError());
+                            }
+
+                            nid.uFlags = NIF_INFO | NIF_REALTIME;
+                            wcsncpy_s(nid.szInfoTitle,
+                                sizeof(nid.szInfoTitle) / sizeof(nid.szInfoTitle[0]),
+                                np.from, _TRUNCATE);
+                            wcsncpy_s(nid.szInfo,
+                                sizeof(nid.szInfo) / sizeof(nid.szInfo[0]),
+                                np.content, _TRUNCATE);
+                            nid.dwInfoFlags = NIIF_USER | NIIF_LARGE_ICON;
+                            nid.hBalloonIcon = hIconBalloon;
+
+                            if (!Shell_NotifyIconW(NIM_MODIFY, &nid))
+                            {
+                                OutputDebugPrintf("[Toast] NIM_MODIFY failed: %lu", GetLastError());
+                            }
+                            else
+                            {
+                                OutputDebugPrintf("[Toast] Balloon tip displayed");
+                            }
+                            balloonEnd = GetTickCount() + 6000;
+                        }
+                        else
+                        {
+                            OutputDebugPrintf("[Toast] NIM_ADD failed: %lu", GetLastError());
+                        }
+                    }
+                }
+
+                MSG message = {};
+                while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE))
+                {
+                    TranslateMessage(&message);
+                    DispatchMessageW(&message);
+                }
+
+                if (iconAdded && static_cast<LONG>(GetTickCount() - balloonEnd) >= 0)
+                {
+                    Shell_NotifyIconW(NIM_DELETE, &nid);
+                    iconAdded = false;
+                }
+            }
+
+            HANDLE event = g_notificationEvent;
+            if (event)
+            {
+                MsgWaitForMultipleObjects(1, &event, FALSE, 250, QS_ALLINPUT);
+            }
+            else
+            {
+                Sleep(250);
+            }
         }
-
-        OutputDebugPrintf("[Toast] NIM_ADD success");
-
-        // 步骤 2: NIM_SETVERSION 设置版本 4
-        nid.uVersion = NOTIFYICON_VERSION_4;
-        if (!Shell_NotifyIconW(NIM_SETVERSION, &nid))
-        {
-            OutputDebugPrintf("[Toast] NIM_SETVERSION failed: %lu", GetLastError());
-        }
-
-        // 步骤 3: NIM_MODIFY 显示 balloon tip
-        nid.uFlags = NIF_INFO;
-        wcsncpy_s(nid.szInfoTitle, sizeof(nid.szInfoTitle) / sizeof(nid.szInfoTitle[0]), np->from, _TRUNCATE);
-        wcsncpy_s(nid.szInfo, sizeof(nid.szInfo) / sizeof(nid.szInfo[0]), np->content, _TRUNCATE);
-        nid.dwInfoFlags = NIIF_USER | NIIF_LARGE_ICON;
-        nid.hBalloonIcon = hIconBalloon;
-
-        if (!Shell_NotifyIconW(NIM_MODIFY, &nid))
-        {
-            OutputDebugPrintf("[Toast] NIM_MODIFY failed: %lu", GetLastError());
-        }
-        else
-        {
-            OutputDebugPrintf("[Toast] Balloon tip displayed");
-        }
-
-        // 等待 balloon tip 显示
-        Sleep(6000);
-
-        // 清理
-        Shell_NotifyIconW(NIM_DELETE, &nid);
-        DestroyWindow(hWnd);
-        delete np;
-
-        return 0;
     }
     __except(EXCEPTION_EXECUTE_HANDLER)
     {
         OutputDebugPrintf("[Toast] Exception in notification thread: 0x%X", GetExceptionCode());
+        InterlockedExchange(&g_notificationWorkerRunning, 0);
         return 1;
     }
 }
@@ -140,29 +250,49 @@ static DWORD WINAPI NotificationThread(LPVOID param)
 static void ShowNotification(const char* from, const char* content)
 {
     DWORD now = GetTickCount();
-    if (now - g_LastNotifyTime < 3000)
+    const bool locked = IsWorkstationLocked();
+    if (!locked && now - g_LastNotifyTime < 3000)
     {
         return;
     }
-    g_LastNotifyTime = now;
+    if (!locked)
+        g_LastNotifyTime = now;
 
-    NotificationParams* np = new NotificationParams();
+    NotificationParams np = {};
 
     // 转换 UTF-8 到 UTF-16
-    MultiByteToWideChar(CP_UTF8, 0, from ? from : "WeChat", -1, np->from, 256);
-    MultiByteToWideChar(CP_UTF8, 0, content ? content : "New Message", -1, np->content, 512);
+    MultiByteToWideChar(CP_UTF8, 0, from ? from : "WeChat", -1, np.from, 256);
+    MultiByteToWideChar(CP_UTF8, 0, content ? content : "New Message", -1, np.content, 512);
 
-    HANDLE hThread = CreateThread(nullptr, 0, NotificationThread, np, 0, nullptr);
-    if (hThread)
+    bool startWorker = false;
+    HANDLE event = nullptr;
+    AcquireSRWLockExclusive(&g_notificationLock);
+    g_pendingNotification = np;
+    g_pendingNotificationValid = true;
+    if (g_notificationEvent == nullptr)
+        g_notificationEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    event = g_notificationEvent;
+    if (event && InterlockedCompareExchange(&g_notificationWorkerRunning, 1, 0) == 0)
+        startWorker = true;
+
+    if (startWorker)
     {
-        CloseHandle(hThread);
-        OutputDebugPrintf("[Toast] Notification thread created");
+        HANDLE hThread = CreateThread(nullptr, 0, NotificationThread, nullptr, 0, nullptr);
+        if (hThread)
+        {
+            CloseHandle(hThread);
+            OutputDebugPrintf("[Toast] Notification thread created (single worker)");
+        }
+        else
+        {
+            InterlockedExchange(&g_notificationWorkerRunning, 0);
+            OutputDebugPrintf("[Toast] CreateThread failed: %lu", GetLastError());
+        }
     }
-    else
-    {
-        OutputDebugPrintf("[Toast] CreateThread failed: %lu", GetLastError());
-        delete np;
-    }
+    ReleaseSRWLockExclusive(&g_notificationLock);
+
+    if (event)
+        SetEvent(event);
 }
 
 using ShellNotifyIconWFunc = BOOL (WINAPI *)(DWORD, PNOTIFYICONDATAW);
@@ -368,8 +498,10 @@ static BOOL WINAPI HookedShellNotifyIconW(DWORD message, PNOTIFYICONDATAW data)
 
 static BOOL WINAPI HookedFlashWindowEx(PFLASHWINFO pfwi)
 {
+    CONTEXT hook_context;
+    RtlCaptureContext(&hook_context);
     const uintptr_t return_address = reinterpret_cast<uintptr_t>(_ReturnAddress());
-    ObserveFlashWindowEx(return_address, pfwi);
+    ObserveFlashWindowEx(return_address, pfwi, hook_context.Rdi);
 
     OutputDebugPrintf("[Hook] FlashWindowEx called hwnd=%p flags=0x%X count=%u",
         pfwi ? pfwi->hwnd : nullptr, pfwi ? pfwi->dwFlags : 0,

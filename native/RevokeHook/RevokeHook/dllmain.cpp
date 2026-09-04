@@ -26,7 +26,8 @@ static HANDLE g_hLogFile = INVALID_HANDLE_VALUE;
 // Balloon notification bridge
 extern "C" void SendWindowsNotification(const char* from_utf8, const char* content_utf8);
 bool InitNotifyIatHook();
-extern "C" void ObserveFlashWindowEx(uintptr_t return_address, const FLASHWINFO *flash_info);
+extern "C" void ObserveFlashWindowEx(uintptr_t return_address,
+    const FLASHWINFO *flash_info, uint64_t caller_rdi);
 static void SendWindowsNotification(const std::string &from, const std::string &content);
 
 //VEH + INT3断点
@@ -1260,7 +1261,8 @@ static bool ReadFlashWindowInfoSafe(const FLASHWINFO *flash_info,
     }
 }
 
-extern "C" void ObserveFlashWindowEx(uintptr_t return_address, const FLASHWINFO *flash_info)
+extern "C" void ObserveFlashWindowEx(uintptr_t return_address,
+    const FLASHWINFO *flash_info, uint64_t caller_rdi)
 {
     EnsureFlashCallerBreakpoints(return_address);
 
@@ -1305,6 +1307,14 @@ extern "C" void ObserveFlashWindowEx(uintptr_t return_address, const FLASHWINFO 
             true);
         OutputDebugPrintf("[FlashProbe] caller candidate captured=%d from=[%s] content=[%s]",
             captured ? 1 : 0, from.c_str(), content.c_str());
+    }
+
+    if (!captured && caller_rdi != 0)
+    {
+        captured = CaptureNotifyMessage(
+            caller_rdi, 0, 0, from, content, true);
+        OutputDebugPrintf("[FlashProbe] hook-context candidate rdi=%p captured=%d from=[%s] content=[%s]",
+            (void *)caller_rdi, captured ? 1 : 0, from.c_str(), content.c_str());
     }
 
     if (!captured && pending_fresh)
