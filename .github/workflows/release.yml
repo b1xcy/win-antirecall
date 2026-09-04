@@ -1,0 +1,64 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Locate Visual Studio
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsPath = & $vswhere -latest -version "[17.0,18.0)" -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vsPath) { throw "Visual Studio 2022 with C++ tools was not found" }
+          "VS_PATH=$vsPath" >> $env:GITHUB_ENV
+
+      - name: Build
+        shell: cmd
+        run: |
+          call "%VS_PATH%\VC\Auxiliary\Build\vcvars64.bat" || exit /b 1
+
+          msbuild "native\RevokeHook\RevokeHook.sln" /m /p:Configuration=Release /p:Platform=x64 /v:minimal || exit /b 1
+          cl /nologo /O1 /DUNICODE /D_UNICODE /Fo"native\" "native\update_stub.c" /link /SUBSYSTEM:WINDOWS /OUT:"native\update_stub.exe" || exit /b 1
+          dotnet publish "src\WeChatAntiRecall\WeChatAntiRecall.csproj" -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:EnableCompressionInSingleFile=true -o "dist" || exit /b 1
+
+          copy /Y "native\RevokeHook\x64\Release\RevokeHook.dll" "dist\RevokeHook.dll" || exit /b 1
+          copy /Y "native\update_stub.exe" "dist\update_stub.exe" || exit /b 1
+          copy /Y "config.yml" "dist\config.yml" || exit /b 1
+          copy /Y "src\WeChatAntiRecall\Config3.json" "dist\Config3.json" || exit /b 1
+          copy /Y "src\WeChatAntiRecall\Res\IcoE.ico" "dist\IcoE.ico" || exit /b 1
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $archive = "win-antirecall-$env:GITHUB_REF_NAME-win-x64.zip"
+          Compress-Archive -Path "dist\*" -DestinationPath $archive
+          "RELEASE_ARCHIVE=$archive" >> $env:GITHUB_ENV
+
+      - name: Create GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          if (gh release view $tag --repo $env:GITHUB_REPOSITORY 2>$null) {
+            gh release upload $tag $env:RELEASE_ARCHIVE --clobber --repo $env:GITHUB_REPOSITORY
+          } else {
+            gh release create $tag $env:RELEASE_ARCHIVE --verify-tag --generate-notes --title $tag --repo $env:GITHUB_REPOSITORY
+          }
