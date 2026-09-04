@@ -1,20 +1,46 @@
 name: Release
+run-name: Release ${{ inputs.tag || github.ref_name }}
 
 on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要发布的已有 Git 标签（例如 v1.0.0）"
+        required: true
+        type: string
 
 permissions:
   contents: write
 
+env:
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+  RELEASE_ARCHIVE: win-antirecall-${{ inputs.tag || github.ref_name }}-win-x64.zip
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
 jobs:
   release:
     runs-on: windows-latest
+    timeout-minutes: 30
 
     steps:
+      - name: Validate release tag
+        shell: pwsh
+        run: |
+          if ($env:RELEASE_TAG -notmatch '^v[0-9A-Za-z][0-9A-Za-z._+-]*$') {
+            throw "Release tag must start with v and be safe for use in a file name: $env:RELEASE_TAG"
+          }
+
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          fetch-depth: 0
 
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
@@ -47,18 +73,22 @@ jobs:
       - name: Package
         shell: pwsh
         run: |
-          $archive = "win-antirecall-$env:GITHUB_REF_NAME-win-x64.zip"
-          Compress-Archive -Path "dist\*" -DestinationPath $archive
-          "RELEASE_ARCHIVE=$archive" >> $env:GITHUB_ENV
+          Compress-Archive -Path "dist\*" -DestinationPath $env:RELEASE_ARCHIVE -CompressionLevel Optimal
 
       - name: Create GitHub Release
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $tag = $env:GITHUB_REF_NAME
-          if (gh release view $tag --repo $env:GITHUB_REPOSITORY 2>$null) {
-            gh release upload $tag $env:RELEASE_ARCHIVE --clobber --repo $env:GITHUB_REPOSITORY
+          gh release view $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY *> $null
+          $releaseExists = $LASTEXITCODE -eq 0
+
+          if ($releaseExists) {
+            gh release upload $env:RELEASE_TAG $env:RELEASE_ARCHIVE --clobber --repo $env:GITHUB_REPOSITORY
           } else {
-            gh release create $tag $env:RELEASE_ARCHIVE --verify-tag --generate-notes --title $tag --repo $env:GITHUB_REPOSITORY
+            gh release create $env:RELEASE_TAG $env:RELEASE_ARCHIVE --verify-tag --generate-notes --title $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY
+          }
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Failed to publish release $env:RELEASE_TAG"
           }
