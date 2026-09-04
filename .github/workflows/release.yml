@@ -37,13 +37,13 @@ jobs:
           }
 
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           ref: ${{ env.RELEASE_TAG }}
           fetch-depth: 0
 
       - name: Setup .NET
-        uses: actions/setup-dotnet@v4
+        uses: actions/setup-dotnet@v5
         with:
           dotnet-version: "8.0.x"
 
@@ -51,8 +51,8 @@ jobs:
         shell: pwsh
         run: |
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-          $vsPath = & $vswhere -latest -version "[17.0,18.0)" -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
-          if (-not $vsPath) { throw "Visual Studio 2022 with C++ tools was not found" }
+          $vsPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vsPath) { throw "Visual Studio with C++ tools was not found" }
           "VS_PATH=$vsPath" >> $env:GITHUB_ENV
 
       - name: Build
@@ -61,7 +61,7 @@ jobs:
           call "%VS_PATH%\VC\Auxiliary\Build\vcvars64.bat" || exit /b 1
 
           msbuild "native\RevokeHook\RevokeHook.sln" /m /p:Configuration=Release /p:Platform=x64 /v:minimal || exit /b 1
-          cl /nologo /O1 /DUNICODE /D_UNICODE /Fo"native\" "native\update_stub.c" /link /SUBSYSTEM:WINDOWS /OUT:"native\update_stub.exe" || exit /b 1
+          cl /nologo /O1 /DUNICODE /D_UNICODE /Fo"native\update_stub.obj" "native\update_stub.c" /link /SUBSYSTEM:WINDOWS /OUT:"native\update_stub.exe" || exit /b 1
           dotnet publish "src\WeChatAntiRecall\WeChatAntiRecall.csproj" -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:EnableCompressionInSingleFile=true -o "dist" || exit /b 1
 
           copy /Y "native\RevokeHook\x64\Release\RevokeHook.dll" "dist\RevokeHook.dll" || exit /b 1
