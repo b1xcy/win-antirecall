@@ -145,6 +145,7 @@
   <ItemGroup>
     <ClCompile Include="vehbp.cpp" />
     <ClCompile Include="dllmain.cpp" />
+    <ClCompile Include="inline_hook.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

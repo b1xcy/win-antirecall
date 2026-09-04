@@ -14,10 +14,11 @@ echo [3/4] Publishing WeChatAntiRecall.exe
 dotnet publish "%~dp0src\WeChatAntiRecall\WeChatAntiRecall.csproj" -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:EnableCompressionInSingleFile=true -o "%~dp0dist" || exit /b 1
 
 echo [4/4] Copy runtime files
-copy /Y "%~dp0native\RevokeHook\x64\Release\RevokeHook.dll" "%~dp0dist\RevokeHook.dll" >nul
-copy /Y "%~dp0native\update_stub.exe" "%~dp0dist\update_stub.exe" >nul
-copy /Y "%~dp0config.yml" "%~dp0dist\config.yml" >nul
-copy /Y "%~dp0src\WeChatAntiRecall\Config3.json" "%~dp0dist\Config3.json" >nul
+copy /Y "%~dp0native\RevokeHook\x64\Release\RevokeHook.dll" "%~dp0dist\RevokeHook.dll" >nul || exit /b 1
+copy /Y "%~dp0native\update_stub.exe" "%~dp0dist\update_stub.exe" >nul || exit /b 1
+copy /Y "%~dp0config.yml" "%~dp0dist\config.yml" >nul || exit /b 1
+copy /Y "%~dp0src\WeChatAntiRecall\Config3.json" "%~dp0dist\Config3.json" >nul || exit /b 1
+copy /Y "%~dp0src\WeChatAntiRecall\Res\IcoE.ico" "%~dp0dist\IcoE.ico" >nul || exit /b 1
 
 echo.
 echo BUILD_OK

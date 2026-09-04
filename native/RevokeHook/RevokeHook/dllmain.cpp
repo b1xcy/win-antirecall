@@ -18,21 +18,64 @@
 
 //用于计算MD5
 #pragma comment(lib, "crypt32.lib")
+#pragma comment(lib, "shell32.lib")
 
 //打印日志
 static HANDLE g_hLogFile = INVALID_HANDLE_VALUE;
 
+// Balloon notification bridge
+extern "C" void SendWindowsNotification(const char* from_utf8, const char* content_utf8);
+bool InitNotifyIatHook();
+extern "C" void ObserveFlashWindowEx(uintptr_t return_address, const FLASHWINFO *flash_info);
+static void SendWindowsNotification(const std::string &from, const std::string &content);
+
 //VEH + INT3断点
 static void* g_bpDelMsg = nullptr;
 static void* g_bpAdd2DB = nullptr;
+static void* g_bpAdd2DBTarget = nullptr;
 
 static DWORD g_tlsThreadState = TLS_OUT_OF_INDEXES;
+struct FlashCallerState
+{
+    uint64_t callsite;
+    uint64_t rcx;
+    uint64_t rdx;
+    uint64_t r8;
+    uint64_t r9;
+    uint64_t rax;
+    uint64_t rbx;
+    uint64_t rsi;
+    uint64_t rdi;
+    uint64_t r14;
+    uint64_t r15;
+    uint64_t rsp;
+    DWORD tick;
+    uint8_t valid;
+    uint8_t dumped;
+};
+
 struct ThreadState
 {
     uint8_t last_org_srvid[8];      //真实的srvid 防止插入两条撤回提醒
     uint8_t anti_revoke_cur_msg;    //是否防撤回当前这条消息
     char pending_content[512];      // DelMsg.RDX+0x1A0 原文 / [图片] 等, 同线程带给 Add2DB
+    FlashCallerState flash_caller;
+    uint64_t pending_notify_msg;
+    uint64_t pending_notify_content_arg;
+    DWORD pending_notify_tick;
+    uint8_t pending_notify_valid;
+    uint8_t suppress_next_notify;
+    char pending_notify_from[256];
+    char pending_notify_content[1024];
+    // 诊断转储去重：同一消息对象可能触发多次 UI 闪烁，只转储一次。
+    uint64_t notify_dump_seen[32];
+    uint8_t notify_dump_seen_count;
 };
+
+static constexpr int kMaxFlashCallerBreakpoints = 8;
+static void *g_bpFlashCaller[kMaxFlashCallerBreakpoints] = {};
+static int g_bpFlashCallerCount = 0;
+static volatile LONG g_flashCallerDiscovery = 0;
 
 static ThreadState* GetThreadState()
 {
@@ -109,7 +152,7 @@ struct DELMSGINFO
 struct ADD2DBINFO
 {
     bool initialized;
-    int arg_msg_index;      // 消息结构体参数, Config2 为 3 (R8)
+    int arg_msg_index;      // 消息结构体参数, 当前 4.1.9 为 3 (R8)
     int arg_bool_index;     // 允许新 srvid 的 bool, Config2 为 5 ([rsp+0x20])
     int offset_srvid;       // srvid在消息结构体中的偏移
     int offset_revoke_xml;  // revoke_xml StdString 偏移
@@ -134,6 +177,11 @@ bool g_anti_revoke_self_msg = false; //是否防止自己撤回消息
 bool g_output_debeug_msg = false; //是否输出调试信息
 std::string g_tip_phrase = revoke_tip::kDefaultPhrase;
 bool g_block_update = false;
+bool g_notify_new_message = false; //是否通知新消息
+// 新消息诊断：在 debug 日志中转储 Add2DB 收到的消息对象字段。
+// 该开关只读内存，不会修改微信对象；用于定位不同消息类型的正文偏移。
+bool g_notify_dump_all = false;
+std::string g_notify_probe_text = "__WA_NOTIFY_PROBE_7F3A__";
 static volatile LONG g_stopUpdateBlocker = 0;
 
 static wchar_t g_selfDir[MAX_PATH] = {};
@@ -360,6 +408,19 @@ static bool LoadYamlSettings(const wchar_t *path)
         else if (key == "debug")
         {
             g_output_debeug_msg = ParseYamlBool(val);
+        }
+        else if (key == "notify_new_message")
+        {
+            g_notify_new_message = ParseYamlBool(val);
+        }
+        else if (key == "notify_dump_all")
+        {
+            g_notify_dump_all = ParseYamlBool(val);
+        }
+        else if (key == "notify_probe_text")
+        {
+            // 诊断标记只作为查找字符串使用，空值表示关闭标记匹配。
+            g_notify_probe_text = val;
         }
     }
     return true;
@@ -669,6 +730,78 @@ static void SanitizeDumpValue(std::string &value)
     }
 }
 
+static bool MatchesNotifyProbe(const std::string &value)
+{
+    return !g_notify_probe_text.empty() &&
+        value.find(g_notify_probe_text) != std::string::npos;
+}
+
+static void LogNotifyProbe(const char *tag, size_t offset, uint64_t storage,
+    const std::string &value, const char *where)
+{
+    if (!MatchesNotifyProbe(value))
+        return;
+
+    std::string preview = value;
+    SanitizeDumpValue(preview);
+    OutputDebugPrintf(
+        "[NotifyProbe] marker=[%s] %s object_offset=+0x%03X storage=%p where=%s value=[%s]",
+        g_notify_probe_text.c_str(), tag, (unsigned)offset, (void *)storage,
+        where ? where : "field", preview.c_str());
+}
+
+// 直接转储一个 MSVC std::string 参数（例如 Add2DB 目标函数的 R9）。
+// 与对象扫描分开记录，便于确认“正文参数”是否就是用户发送的文本。
+static void DumpNotifyStdString(const StdString *ss, const char *tag)
+{
+    if (!g_output_debeug_msg || ss == nullptr)
+        return;
+
+    StdString meta{};
+    if (!SafeReadBytes(ss, &meta, sizeof(meta)))
+        return;
+
+    std::string value;
+    if (!ReadMsStdString(ss, value))
+    {
+        OutputDebugPrintf("[NotifyDump] %s ptr=%p invalid std::string size=%lld cap=%lld",
+            tag, (const void *)ss, (long long)meta.size, (long long)meta.capability);
+        return;
+    }
+
+    uint64_t storage = (uint64_t)ss;
+    if (meta.capability >= 16)
+        memcpy(&storage, meta.data_ptr, sizeof(storage));
+
+    std::string preview = value;
+    SanitizeDumpValue(preview);
+    OutputDebugPrintf(
+        "[NotifyDump] %s ptr=%p storage=%p size=%lld cap=%lld class=%s value=[%s]",
+        tag, (const void *)ss, (void *)storage, (long long)meta.size,
+        (long long)meta.capability, ClassifyDumpString(value), preview.c_str());
+    LogNotifyProbe(tag, 0, storage, value, "direct-string");
+}
+
+static void ScanNotifyProbeRaw(uint64_t base, size_t range, const char *tag)
+{
+    if (!g_output_debeug_msg || g_notify_probe_text.empty() || base == 0 || range == 0)
+        return;
+
+    // 仅扫描当前对象的已提交连续区域；字符串存储区由 DumpObjectStrings
+    // 单独扫描，因此这里不会遍历整个进程地址空间。
+    if (!IsMemoryReadable((void *)base, range))
+        return;
+    std::string bytes(range, '\0');
+    if (!SafeReadBytes((void *)base, &bytes[0], range))
+        return;
+    const size_t found = bytes.find(g_notify_probe_text);
+    if (found != std::string::npos)
+    {
+        OutputDebugPrintf("[NotifyProbe] marker=[%s] %s raw_offset=+0x%03X",
+            g_notify_probe_text.c_str(), tag, (unsigned)found);
+    }
+}
+
 static void DumpObjectStrings(uint64_t base, size_t range, const char *tag)
 {
     if (!g_output_debeug_msg)
@@ -676,6 +809,7 @@ static void DumpObjectStrings(uint64_t base, size_t range, const char *tag)
     if (base == 0 || range < sizeof(StdString) || !IsMemoryReadable((void *)base, 16))
         return;
     OutputDebugPrintf("[Dump] %s base=%p range=0x%X", tag, (void *)base, (unsigned)range);
+    ScanNotifyProbeRaw(base, range, tag);
 
     static const uint32_t kMsgTypes[] = {1, 3, 34, 42, 43, 47, 48, 49, 50, 62, 10000, 10002};
     for (int off = 0x00; off <= 0x80; off += 4)
@@ -699,14 +833,22 @@ static void DumpObjectStrings(uint64_t base, size_t range, const char *tag)
         StdString *ss = (StdString *)(base + off);
         if (!ReadMsStdString(ss, value) || value.empty())
             continue;
+        StdString meta{};
+        if (!SafeReadBytes(ss, &meta, sizeof(meta)))
+            continue;
         const char *kind = ClassifyDumpString(value);
-        int64_t cap = ss->capability;
+        int64_t cap = meta.capability;
+        uint64_t storage = (uint64_t)ss;
+        if (meta.capability >= 16)
+            memcpy(&storage, meta.data_ptr, sizeof(storage));
         SanitizeDumpValue(value);
         char line[OUT_DEBUG_BUF_LEN];
         _snprintf_s(line, sizeof(line), _TRUNCATE,
-            "[Dump] %s +0x%03X str size=%llu cap=%lld class=%s: %s",
-            tag, (unsigned)off, (unsigned long long)ss->size, (long long)cap, kind, value.c_str());
+            "[Dump] %s +0x%03X str storage=%p size=%lld cap=%lld class=%s: %s",
+            tag, (unsigned)off, (void *)storage, (long long)meta.size,
+            (long long)cap, kind, value.c_str());
         LogLine(line);
+        LogNotifyProbe(tag, off, storage, value, "object-string");
     }
 }
 
@@ -760,6 +902,45 @@ static void DumpOneDelMsgObj(uint64_t *seen, int *nseen, int maxSeen, uint64_t p
     DumpObjectDeep(ptr, name);
 }
 
+static bool RememberNotifyDump(ThreadState *state, uint64_t ptr)
+{
+    if (state == nullptr || ptr == 0)
+        return false;
+    for (uint8_t i = 0; i < state->notify_dump_seen_count; i++)
+    {
+        if (state->notify_dump_seen[i] == ptr)
+            return false;
+    }
+
+    if (state->notify_dump_seen_count < _countof(state->notify_dump_seen))
+    {
+        state->notify_dump_seen[state->notify_dump_seen_count++] = ptr;
+    }
+    else
+    {
+        // 保留最近一批对象，避免长时间运行后数组无限增长；对象地址
+        // 一般不会在同一会话内快速复用。
+        memmove(state->notify_dump_seen,
+            state->notify_dump_seen + 1,
+            (state->notify_dump_seen_count - 1) * sizeof(state->notify_dump_seen[0]));
+        state->notify_dump_seen[state->notify_dump_seen_count - 1] = ptr;
+    }
+    return true;
+}
+
+static void DumpNotifyPointer(ThreadState *state, uint64_t ptr, const char *tag)
+{
+    if (!g_output_debeug_msg || !g_notify_dump_all || ptr == 0 ||
+        !LooksLikeHeapObject(ptr))
+        return;
+    if (!RememberNotifyDump(state, ptr))
+        return;
+
+    uint64_t seen[24] = {};
+    int nseen = 0;
+    DumpOneDelMsgObj(seen, &nseen, _countof(seen), ptr, tag);
+}
+
 static void DumpArgs(PCONTEXT ctx, const char *tag)
 {
     OutputDebugPrintf("[Debug] %s RCX=%p RDX=%p R8=%p R9=%p RSP=%p",
@@ -773,6 +954,55 @@ static void DumpArgs(PCONTEXT ctx, const char *tag)
             tag,
             sp[0x20], sp[0x21], sp[0x22], sp[0x23], sp[0x24], sp[0x25], sp[0x26], sp[0x27],
             sp[0x28], sp[0x29], sp[0x2A], sp[0x2B], sp[0x2C], sp[0x2D], sp[0x2E], sp[0x2F]);
+    }
+}
+
+static void DumpNotifyContext(ThreadState *state, PCONTEXT ctx, const char *tag,
+    bool target_has_content_arg)
+{
+    if (!g_output_debeug_msg || !g_notify_dump_all || state == nullptr || ctx == nullptr)
+        return;
+
+    OutputDebugPrintf(
+        "[NotifyDump] %s tid=%lu RCX=%p RDX=%p R8=%p R9=%p RAX=%p RBX=%p RSI=%p RDI=%p R14=%p R15=%p RSP=%p",
+        tag, (unsigned long)GetCurrentThreadId(),
+        (void *)ctx->Rcx, (void *)ctx->Rdx, (void *)ctx->R8, (void *)ctx->R9,
+        (void *)ctx->Rax, (void *)ctx->Rbx, (void *)ctx->Rsi, (void *)ctx->Rdi,
+        (void *)ctx->R14, (void *)ctx->R15, (void *)ctx->Rsp);
+
+    // 当前目标入口的 R9 是辅助 wxid std::string，不是正文；单独打印
+    // 便于和消息对象字段对照。
+    if (target_has_content_arg)
+        DumpNotifyStdString((const StdString *)ctx->R9,
+            "NotifyTarget.R9(auxiliary-wxid)");
+
+    DumpNotifyPointer(state, ctx->Rcx, "NotifyDump.RCX");
+    DumpNotifyPointer(state, ctx->Rdx, "NotifyDump.RDX");
+    DumpNotifyPointer(state, ctx->R8, "NotifyDump.R8");
+    if (!target_has_content_arg)
+        DumpNotifyPointer(state, ctx->R9, "NotifyDump.R9");
+    DumpNotifyPointer(state, ctx->Rax, "NotifyDump.RAX");
+    DumpNotifyPointer(state, ctx->Rbx, "NotifyDump.RBX");
+    DumpNotifyPointer(state, ctx->Rsi, "NotifyDump.RSI");
+    DumpNotifyPointer(state, ctx->Rdi, "NotifyDump.RDI");
+    DumpNotifyPointer(state, ctx->R14, "NotifyDump.R14");
+    DumpNotifyPointer(state, ctx->R15, "NotifyDump.R15");
+
+    // 记录前 8 个栈参数；其中可能包含由调用者暂存的消息对象或
+    // std::string 地址。只对看起来像堆对象的值递归转储。
+    uint8_t *sp = (uint8_t *)ctx->Rsp;
+    for (int i = 0; i < 8; i++)
+    {
+        uint64_t value = 0;
+        const size_t offset = 0x20 + (size_t)i * sizeof(uint64_t);
+        if (!SafeReadBytes(sp + offset, &value, sizeof(value)))
+            break;
+        OutputDebugPrintf("[NotifyDump] %s stack+0x%02X=%p", tag,
+            (unsigned)offset, (void *)value);
+        char stackTag[96];
+        _snprintf_s(stackTag, sizeof(stackTag), _TRUNCATE,
+            "%s.stack+0x%02X", tag, (unsigned)offset);
+        DumpNotifyPointer(state, value, stackTag);
     }
 }
 
@@ -836,6 +1066,297 @@ static uint8_t *PeSection(HMODULE mod, const char *name, size_t *out_size)
         }
     }
     return nullptr;
+}
+
+static void OnTargetHit(PCONTEXT ctx, PEXCEPTION_RECORD pExc);
+static bool CaptureNotifyMessage(uint64_t message_object, uint64_t content_arg,
+    uint64_t auxiliary_object, std::string &from, std::string &content,
+    bool flash_layout = false);
+
+static bool IsFlashCallerBreakpoint(uint64_t rip)
+{
+    for (int i = 0; i < g_bpFlashCallerCount; i++)
+    {
+        if ((uint64_t)g_bpFlashCaller[i] == rip)
+            return true;
+    }
+    return false;
+}
+
+static uint8_t *FindContainingFunction(uint8_t *img, uint8_t *address)
+{
+    if (img == nullptr || address == nullptr)
+        return nullptr;
+
+    auto *base = img;
+    auto *dos = reinterpret_cast<IMAGE_DOS_HEADER *>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE)
+        return nullptr;
+    auto *nt = reinterpret_cast<IMAGE_NT_HEADERS64 *>(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE)
+        return nullptr;
+
+    const auto &exception = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+    if (exception.VirtualAddress == 0 || exception.Size < sizeof(RUNTIME_FUNCTION))
+        return nullptr;
+
+    const uint64_t addressRva = (uint64_t)(address - base);
+    const size_t count = exception.Size / sizeof(RUNTIME_FUNCTION);
+    auto *entries = reinterpret_cast<RUNTIME_FUNCTION *>(base + exception.VirtualAddress);
+    for (size_t i = 0; i < count; i++)
+    {
+        const RUNTIME_FUNCTION &entry = entries[i];
+        if (entry.BeginAddress <= addressRva && addressRva < entry.EndAddress)
+            return base + entry.BeginAddress;
+    }
+    return nullptr;
+}
+
+static void DiscoverAdd2DBTargetBreakpoint()
+{
+    if (g_bpAdd2DBTarget != nullptr || g_bpAdd2DB == nullptr)
+        return;
+
+    uint8_t *site = reinterpret_cast<uint8_t *>(g_bpAdd2DB);
+    if (!IsMemoryReadable(site, 5))
+    {
+        OutputDebugPrintf("[Add2DB] Cannot read target call site %p", site);
+        return;
+    }
+
+    uint8_t *target = nullptr;
+    if (site[0] == 0xE8)
+    {
+        int32_t rel = 0;
+        memcpy(&rel, site + 1, sizeof(rel));
+        target = site + 5 + rel;
+    }
+    else
+    {
+        OutputDebugPrintf("[Add2DB] Unexpected call opcode at %p: %02X", site, site[0]);
+        return;
+    }
+
+    if (target == nullptr || !IsMemoryReadable(target, 1))
+    {
+        OutputDebugPrintf("[Add2DB] Invalid target resolved from %p", site);
+        return;
+    }
+
+    int handle = VehBp_Set(target, OnTargetHit);
+    if (handle < 0)
+    {
+        OutputDebugPrintf("[Add2DB] Target breakpoint install failed at %p", target);
+        return;
+    }
+
+    g_bpAdd2DBTarget = target;
+    OutputDebugPrintf("[Add2DB] Target entry breakpoint %p (call site %p)", target, site);
+}
+
+static void DiscoverFlashCallerBreakpoints(uint8_t *img, uint8_t *callsite)
+{
+    if (img == nullptr || callsite == nullptr || g_bpFlashCallerCount != 0)
+        return;
+
+    uint8_t *helper = FindContainingFunction(img, callsite);
+    if (helper == nullptr)
+    {
+        OutputDebugPrintf("[FlashProbe] Cannot resolve FlashWindowEx containing function");
+        return;
+    }
+
+    size_t text_size = 0;
+    uint8_t *text = PeSection((HMODULE)img, ".text", &text_size);
+    if (text == nullptr || text_size < 5)
+    {
+        OutputDebugPrintf("[FlashProbe] Cannot locate Weixin .text");
+        return;
+    }
+
+    const uint64_t helper_addr = (uint64_t)helper;
+    int found = 0;
+    for (size_t i = 0; i + 5 <= text_size && found < kMaxFlashCallerBreakpoints; i++)
+    {
+        if (text[i] != 0xE8)
+            continue;
+
+        int32_t rel = 0;
+        memcpy(&rel, text + i + 1, sizeof(rel));
+        uint8_t *target = text + i + 5 + rel;
+        if ((uint64_t)target != helper_addr)
+            continue;
+
+        int handle = VehBp_Set(text + i, OnTargetHit);
+        if (handle < 0)
+        {
+            OutputDebugPrintf("[FlashProbe] VehBp_Set failed at %p", text + i);
+            continue;
+        }
+
+        g_bpFlashCaller[found++] = text + i;
+        OutputDebugPrintf("[FlashProbe] caller breakpoint %p -> helper %p", text + i, helper);
+    }
+    g_bpFlashCallerCount = found;
+    OutputDebugPrintf("[FlashProbe] discovered %d caller breakpoint(s)", found);
+}
+
+static void EnsureFlashCallerBreakpoints(uintptr_t return_address)
+{
+    if (return_address == 0 || g_config_info.basic_info.imgbase == 0)
+        return;
+    if (InterlockedCompareExchange(&g_flashCallerDiscovery, 1, 0) != 0)
+        return;
+
+    uint8_t *img = reinterpret_cast<uint8_t *>(g_config_info.basic_info.imgbase);
+    uint8_t *ret = reinterpret_cast<uint8_t *>(return_address);
+    uint8_t *callsite = nullptr;
+
+    // The current Weixin build emits FF 15 disp32 for the delay-IAT call.
+    if (ret >= img + 6 && IsMemoryReadable(ret - 6, 6) &&
+        ret[-6] == 0xFF && ret[-5] == 0x15)
+    {
+        callsite = ret - 6;
+    }
+    else if (ret >= img + 5 && IsMemoryReadable(ret - 5, 5) && ret[-5] == 0xE8)
+    {
+        callsite = ret - 5;
+    }
+
+    if (callsite != nullptr)
+    {
+        OutputDebugPrintf("[FlashProbe] return=%p callsite=%p", ret, callsite);
+        DiscoverFlashCallerBreakpoints(img, callsite);
+    }
+    else
+    {
+        OutputDebugPrintf("[FlashProbe] unrecognized callsite return=%p", ret);
+    }
+    InterlockedExchange(&g_flashCallerDiscovery, 2);
+}
+
+static bool ReadFlashWindowInfoSafe(const FLASHWINFO *flash_info,
+    HWND *hwnd, UINT *flags, UINT *count)
+{
+    if (hwnd == nullptr || flags == nullptr || count == nullptr ||
+        flash_info == nullptr || !IsMemoryReadable(flash_info, sizeof(FLASHWINFO)))
+    {
+        return false;
+    }
+
+    __try
+    {
+        *hwnd = flash_info->hwnd;
+        *flags = flash_info->dwFlags;
+        *count = flash_info->uCount;
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        *hwnd = nullptr;
+        *flags = 0;
+        *count = 0;
+        return false;
+    }
+}
+
+extern "C" void ObserveFlashWindowEx(uintptr_t return_address, const FLASHWINFO *flash_info)
+{
+    EnsureFlashCallerBreakpoints(return_address);
+
+    ThreadState *state = GetThreadState();
+    if (state == nullptr)
+        return;
+
+    uint32_t flags = 0;
+    uint32_t count = 0;
+    HWND hwnd = nullptr;
+    ReadFlashWindowInfoSafe(flash_info, &hwnd, &flags, &count);
+
+    OutputDebugPrintf("[FlashProbe] observed return=%p hwnd=%p flags=0x%X count=%u caller_valid=%d",
+        (void *)return_address, hwnd, flags, count,
+        state->flash_caller.valid ? 1 : 0);
+
+    // 仅把任务栏闪烁作为新消息的时序锚点，避免其他窗口动画误触发。
+    if ((flags & FLASHW_TRAY) == 0)
+        return;
+
+    const DWORD now = GetTickCount();
+    const bool pending_fresh = state->pending_notify_valid != 0 &&
+        (now - state->pending_notify_tick) <= 1500;
+    const bool caller_fresh = state->flash_caller.valid != 0 &&
+        (now - state->flash_caller.tick) <= 1500;
+
+    std::string from;
+    std::string content;
+    bool captured = false;
+    // RDI 的通知对象是当前 Flash 事件的同一份现场数据，优先级高于
+    // 可能来自其它线程/上一条消息的 Add2DB 暂存候选。
+    if (caller_fresh)
+    {
+        // FlashWindowEx 的调用者现场中 RDI 指向通知消息对象；RBX 是
+        // 另一个内部对象，扫描它会得到加密串、配置项或旧对话内容。
+        captured = CaptureNotifyMessage(
+            state->flash_caller.rdi,
+            0,
+            0,
+            from,
+            content,
+            true);
+        OutputDebugPrintf("[FlashProbe] caller candidate captured=%d from=[%s] content=[%s]",
+            captured ? 1 : 0, from.c_str(), content.c_str());
+    }
+
+    if (!captured && pending_fresh)
+    {
+        from = state->pending_notify_from;
+        content = state->pending_notify_content;
+        captured = !content.empty();
+        if (!captured)
+        {
+            captured = CaptureNotifyMessage(
+                state->pending_notify_msg,
+                state->pending_notify_content_arg,
+                0,
+                from,
+                content);
+        }
+        OutputDebugPrintf("[FlashProbe] pending candidate age=%lu captured=%d from=[%s] content=[%s]",
+            (unsigned long)(now - state->pending_notify_tick), captured ? 1 : 0,
+            from.c_str(), content.c_str());
+    }
+    else if (pending_fresh)
+    {
+        OutputDebugPrintf("[FlashProbe] pending candidate superseded by RDI content");
+    }
+    if (pending_fresh)
+        state->pending_notify_valid = 0;
+
+    if (captured && !content.empty())
+    {
+        OutputDebugPrintf("[FlashProbe] sending notification from=[%s] content=[%s]",
+            from.c_str(), content.c_str());
+        SendWindowsNotification(from, content);
+    }
+
+    if (state->flash_caller.valid)
+    {
+        OutputDebugPrintf("[FlashProbe] caller callsite=%p RCX=%p RDX=%p R8=%p R9=%p RAX=%p RBX=%p RSI=%p RDI=%p R14=%p R15=%p RSP=%p age=%lu",
+            (void *)state->flash_caller.callsite,
+            (void *)state->flash_caller.rcx,
+            (void *)state->flash_caller.rdx,
+            (void *)state->flash_caller.r8,
+            (void *)state->flash_caller.r9,
+            (void *)state->flash_caller.rax,
+            (void *)state->flash_caller.rbx,
+            (void *)state->flash_caller.rsi,
+            (void *)state->flash_caller.rdi,
+            (void *)state->flash_caller.r14,
+            (void *)state->flash_caller.r15,
+            (void *)state->flash_caller.rsp,
+            (unsigned long)(GetTickCount() - state->flash_caller.tick));
+        state->flash_caller.valid = 0;
+    }
 }
 
 // Add2DBOffset 落在 wrapper 里的 call CoAddMessageToDB 上。wrapper 的唯一调用方
@@ -1219,6 +1740,15 @@ static uint64_t ReadUint64At(uint64_t base, int offset)
 static uint32_t FindLikelyMsgType(uint64_t base)
 {
     static const uint32_t kTypes[] = {3, 34, 43, 47, 48, 49, 50, 62, 42, 10000, 10002, 1};
+    uint32_t direct = 0;
+    if (SafeReadBytes((void *)(base + 0x164), &direct, sizeof(direct)))
+    {
+        for (uint32_t type : kTypes)
+        {
+            if (direct == type)
+                return direct;
+        }
+    }
     for (int off = 0x08; off <= 0x40; off += 4)
     {
         uint8_t *addr = (uint8_t *)(base + off);
@@ -1429,6 +1959,33 @@ static std::string PickContentField(const std::vector<ContentField> &fields, siz
     return best;
 }
 
+/**
+ * @brief 使用 Win32 balloon tip 发送 Windows 通知
+ * @param from 发送者名称
+ * @param content 消息内容
+ */
+static void SendWindowsNotification(const std::string &from, const std::string &content)
+{
+    OutputDebugPrintf("[Notification] SendWindowsNotification called, g_notify_new_message=%d", g_notify_new_message);
+
+    if (!g_notify_new_message)
+    {
+        OutputDebugPrintf("[Notification] Disabled by config");
+        return;
+    }
+
+    std::string title = from.empty() ? "新消息" : from;
+    std::string body = content.empty() ? "[消息]" : content;
+
+    OutputDebugPrintf("[Notification] Original: from=[%s] content=[%s]", from.c_str(), content.c_str());
+
+    // 截断过长内容
+    body = revoke_tip::truncateUtf8(body, 200);
+
+    // 调用 inline_hook.cpp 的 Toast 显示
+    SendWindowsNotification(title.c_str(), body.c_str());
+}
+
 static std::string CaptureOriginalText(uint64_t base)
 {
     if (base == 0)
@@ -1468,6 +2025,176 @@ static std::string CaptureOriginalText(uint64_t base)
     if (msgType != 0 && msgType != 1)
         return revoke_tip::messageKindPlaceholder(msgType);
     return "";
+}
+
+static void CopyNotifyField(char *dst, size_t dst_size, const std::string &value)
+{
+    if (dst == nullptr || dst_size == 0)
+        return;
+    dst[0] = '\0';
+    if (!value.empty())
+        strncpy_s(dst, dst_size, value.c_str(), _TRUNCATE);
+}
+
+static bool CaptureNotifyMessage(uint64_t message_object, uint64_t content_arg,
+    uint64_t auxiliary_object, std::string &from, std::string &content,
+    bool flash_layout)
+{
+    from.clear();
+    content.clear();
+    if (message_object == 0 || !IsMemoryReadable((void *)message_object, 0x100))
+        return false;
+
+    const uint32_t msg_type = FindLikelyMsgType(message_object);
+    std::vector<ContentField> fields;
+    size_t msgsource_off = (size_t)-1;
+
+    auto read_field = [&](size_t offset, std::string &value) -> bool
+    {
+        value.clear();
+        return ReadMsStdString(
+            (const StdString *)(message_object + offset), value);
+    };
+    auto read_preview = [&](size_t offset, std::string &value) -> bool
+    {
+        std::string raw;
+        if (!read_field(offset, raw))
+            return false;
+        value = PreviewFromField(raw, msg_type);
+        return !value.empty();
+    };
+
+    if (flash_layout)
+    {
+        // Flash caller 的 RDI 是通知对象。根据 4.1.9.57 的现场，
+        // +0x48 和 +0x2D0 都保存当前正文，+0x68 是上一段无关对话，
+        // 因此绝不能使用通用“最长字符串”启发式去选 +0x68。
+        std::string at48;
+        std::string at2d0;
+        const bool have48 = read_preview(0x48, at48);
+        const bool have2d0 = read_preview(0x2D0, at2d0);
+        if (have48 && have2d0 && at48 != at2d0)
+        {
+            OutputDebugPrintf(
+                "[FlashProbe] content fields differ +0x48=[%s] +0x2D0=[%s]; using +0x48",
+                at48.c_str(), at2d0.c_str());
+        }
+        if (have48)
+            content = at48;
+        else if (have2d0)
+            content = at2d0;
+        else
+            read_preview(0x1A0, content);
+
+        OutputDebugPrintf(
+            "[FlashProbe] direct fields +0x48=%d +0x2D0=%d +0x1A0 content=[%s]",
+            have48 ? 1 : 0, have2d0 ? 1 : 0, content.c_str());
+    }
+    else
+    {
+        // 当前目标入口的 R9 是辅助 wxid 字符串；若未来版本传入真正
+        // 的正文参数，仍先尝试它，再读取消息对象的固定正文槽。
+        if (content_arg != 0 && IsMemoryReadable((void *)content_arg, sizeof(StdString)))
+        {
+            std::string value;
+            if (ReadMsStdString((const StdString *)content_arg, value))
+                content = PreviewFromField(value, msg_type);
+        }
+
+        // 消息对象中常见的正文槽，随后再用带 msgsource 过滤的扫描兜底。
+        static const size_t kPreferredContent[] = {
+            0x1A0, 0x18, 0x38, 0x48, 0x2D0,
+            0x180, 0x1C0, 0x160, 0x1E0, 0x140, 0x200, 0x220
+        };
+        if (content.empty())
+        {
+            for (size_t offset : kPreferredContent)
+            {
+                std::string value;
+                if (read_preview(offset, value))
+                {
+                    content = value;
+                    break;
+                }
+            }
+        }
+
+        if (content.empty())
+        {
+            CollectContentFields(message_object, 0x500, msg_type, fields, &msgsource_off);
+            content = PickContentField(fields, msgsource_off);
+        }
+        if (content.empty())
+        {
+            // 某些消息把正文放在一层嵌套对象中；复用已有的安全扫描逻辑。
+            content = CaptureOriginalText(message_object);
+        }
+        if (content.empty() && auxiliary_object != 0 &&
+            IsMemoryReadable((void *)auxiliary_object, 0x40))
+        {
+            content = CaptureOriginalText(auxiliary_object);
+        }
+    }
+
+    // 非文本消息没有可读正文时，按真实消息类型给出类型预览（图片/文件等）。
+    if (content.empty() && msg_type != 0 && msg_type != 1)
+        content = revoke_tip::messageKindPlaceholder(msg_type);
+    if (content.empty())
+        return false;
+
+    // Flash caller 的固定布局同时提供昵称和 wxid；昵称更适合作为
+    // 气泡标题，只有昵称缺失时才回退到唯一用户名。
+    size_t wxid_off = (size_t)-1;
+    std::string short_name;
+    if (flash_layout)
+    {
+        std::string nickname;
+        std::string wxid;
+        if (read_field(0x160, nickname) && LooksLikePlainText(nickname) &&
+            !revoke_tip::looksLikeWxId(nickname))
+        {
+            from = nickname;
+        }
+        if (read_field(0x000, wxid) && revoke_tip::looksLikeWxId(wxid))
+        {
+            if (from.empty())
+                from = wxid;
+            OutputDebugPrintf("[FlashProbe] direct sender nickname=[%s] wxid=[%s] selected=[%s]",
+                nickname.c_str(), wxid.c_str(), from.c_str());
+        }
+    }
+    auto scan_sender = [&](uint64_t base, size_t range)
+    {
+        if (base == 0 || !IsMemoryReadable((void *)base, 0x40))
+            return;
+        for (size_t off = 0; off + sizeof(StdString) <= range; off += 8)
+        {
+            std::string value;
+            if (!ReadMsStdString((const StdString *)(base + off), value) || value.empty())
+                continue;
+            if (revoke_tip::looksLikeWxId(value))
+            {
+                if (from.empty())
+                    from = value;
+                if (wxid_off == (size_t)-1)
+                    wxid_off = off;
+                continue;
+            }
+            if (value == content || !LooksLikePlainText(value) || value.size() > 96)
+                continue;
+            if (short_name.empty() || value.size() < short_name.size())
+                short_name = value;
+        }
+    };
+    if (from.empty())
+        scan_sender(message_object, 0x500);
+    if (from.empty())
+        scan_sender(auxiliary_object, 0x300);
+    if (from.empty() && !short_name.empty())
+        from = short_name;
+
+    content = revoke_tip::truncateUtf8(content, 200);
+    return !content.empty();
 }
 
 static bool ApplyCustomTip(StdString *ss, uint64_t fallback_id = 0, const char *extra_content = nullptr)
@@ -1525,6 +2252,84 @@ static void OnTargetHit(PCONTEXT ctx, PEXCEPTION_RECORD /*pExc*/)
     ThreadState* thread_state = GetThreadState();
     if (thread_state == nullptr) {
         OutputDebugString(TEXT("[RevokeHook] GetThreadState Failed!"));
+        return;
+    }
+
+    if (IsFlashCallerBreakpoint(rip))
+    {
+        FlashCallerState &flash = thread_state->flash_caller;
+        flash.callsite = rip;
+        flash.rcx = ctx->Rcx;
+        flash.rdx = ctx->Rdx;
+        flash.r8 = ctx->R8;
+        flash.r9 = ctx->R9;
+        flash.rax = ctx->Rax;
+        flash.rbx = ctx->Rbx;
+        flash.rsi = ctx->Rsi;
+        flash.rdi = ctx->Rdi;
+        flash.r14 = ctx->R14;
+        flash.r15 = ctx->R15;
+        flash.rsp = ctx->Rsp;
+        flash.tick = GetTickCount();
+        flash.valid = 1;
+
+        OutputDebugPrintf("[FlashProbe] caller hit=%p RCX=%p RDX=%p R8=%p R9=%p RAX=%p RBX=%p RSI=%p RDI=%p R14=%p R15=%p RSP=%p",
+            (void *)rip,
+            (void *)flash.rcx,
+            (void *)flash.rdx,
+            (void *)flash.r8,
+            (void *)flash.r9,
+            (void *)flash.rax,
+            (void *)flash.rbx,
+            (void *)flash.rsi,
+            (void *)flash.rdi,
+            (void *)flash.r14,
+            (void *)flash.r15,
+            (void *)flash.rsp);
+
+        // 这里的 caller 是一个“通知对象 -> HWND”的辅助函数调用点。
+        // RDI 保存通知对象；诊断时仍把全部寄存器/栈候选交给
+        // DumpNotifyContext，便于继续比对不同消息类型。
+        DumpNotifyContext(thread_state, ctx, "FlashCaller", false);
+        return;
+    }
+
+    if (g_bpAdd2DBTarget != nullptr && rip == (uint64_t)g_bpAdd2DBTarget)
+    {
+        // 目标函数入口的 R8/R9 分别是消息对象和正文 std::string。
+        DumpNotifyContext(thread_state, ctx, "Add2DBTarget", true);
+        if (thread_state->suppress_next_notify)
+        {
+            thread_state->suppress_next_notify = 0;
+            thread_state->pending_notify_valid = 0;
+            OutputDebugPrintf("[Add2DB] Suppress target entry for anti-recall path");
+            return;
+        }
+
+        thread_state->pending_notify_msg = ctx->R8;
+        thread_state->pending_notify_content_arg = ctx->R9;
+        thread_state->pending_notify_tick = GetTickCount();
+        thread_state->pending_notify_from[0] = '\0';
+        thread_state->pending_notify_content[0] = '\0';
+        thread_state->pending_notify_valid = 1;
+
+        std::string from;
+        std::string content;
+        if (g_notify_new_message && CaptureNotifyMessage(
+            ctx->R8, ctx->R9, ctx->Rdx, from, content))
+        {
+            CopyNotifyField(thread_state->pending_notify_from,
+                sizeof(thread_state->pending_notify_from), from);
+            CopyNotifyField(thread_state->pending_notify_content,
+                sizeof(thread_state->pending_notify_content), content);
+            OutputDebugPrintf("[Add2DB] Cached candidate from=[%s] content=[%s]",
+                from.c_str(), content.c_str());
+        }
+        else
+        {
+            OutputDebugPrintf("[Add2DB] Target entry candidate msg=%p content=%p (capture deferred)",
+                (void *)ctx->R8, (void *)ctx->R9);
+        }
         return;
     }
 
@@ -1661,7 +2466,151 @@ static void OnTargetHit(PCONTEXT ctx, PEXCEPTION_RECORD /*pExc*/)
     }
     else if (rip == (uint64_t)g_bpAdd2DB)
     {
-        if (thread_state->anti_revoke_cur_msg == 0)
+        const bool was_anti_revoke = thread_state->anti_revoke_cur_msg != 0;
+        thread_state->suppress_next_notify = was_anti_revoke ? 1 : 0;
+        thread_state->anti_revoke_cur_msg = 0;
+
+        OutputDebugPrintf("[Add2DB] Hook hit, anti_revoke_cur_msg=%d, g_notify_new_message=%d",
+            was_anti_revoke, g_notify_new_message);
+
+        // 通知所有新消息（不仅仅是撤回消息）
+        if (g_notify_new_message && !was_anti_revoke)
+        {
+            OutputDebugPrintf("[Add2DB] Processing new message notification...");
+
+            // 0x34A68DB 是一个参数重排 wrapper：调用目标前把原始 R9
+            // 放到目标 R8（消息对象），把原始 R8 放到目标 R9（正文
+            // std::string）。因此在 wrapper 断点现场必须反向读取。
+            const int arg_msg_index = 4;     // 原始 R9 -> 目标 R8
+            uint64_t arg_msg = GetArgValue(ctx, arg_msg_index);
+            uint64_t arg_content = GetArgValue(ctx, 3); // 原始 R8 -> 目标 R9
+
+            OutputDebugPrintf("[Add2DB] arg_msg_index=%d, arg_msg=%p", arg_msg_index, (void *)arg_msg);
+
+            if (arg_msg != 0 && IsMemoryReadable((void *)arg_msg, 0x100))
+            {
+                OutputDebugPrintf("[Add2DB] Message object is readable");
+
+                std::string from_name;
+                std::string content;
+
+                const bool captured_by_helper = CaptureNotifyMessage(
+                    arg_msg, arg_content, ctx->Rdx, from_name, content);
+                OutputDebugPrintf("[Add2DB] unified capture=%d from=[%s] content=[%s]",
+                    captured_by_helper ? 1 : 0, from_name.c_str(), content.c_str());
+
+                // 尝试从消息对象中提取发送者和内容
+                uint32_t msgType = FindLikelyMsgType(arg_msg);
+                OutputDebugPrintf("[Add2DB] msgType=%u", msgType);
+
+                // wrapper 的参数在不同调用点可能是正文或辅助 wxid；真正
+                // 稳定的消息正文优先从消息对象固定字段读取。
+                if (content.empty() && arg_content != 0 &&
+                    ReadMsStdString((const StdString *)arg_content, content))
+                {
+                    content = PreviewFromField(content, msgType);
+                }
+                if (content.empty())
+                {
+                    static const size_t kContentOffsets[] = {
+                        0x48, 0x2D0, 0x1A0, 0x18, 0x38
+                    };
+                    for (size_t offset : kContentOffsets)
+                    {
+                        std::string value;
+                        if (ReadMsStdString((const StdString *)(arg_msg + offset), value))
+                        {
+                            value = PreviewFromField(value, msgType);
+                            if (!value.empty())
+                            {
+                                content = value;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                // 扫描消息对象获取内容
+                std::vector<ContentField> fields;
+                size_t msgsourceOff = (size_t)-1;
+                if (content.empty())
+                    CollectContentFields(arg_msg, 0x500, msgType, fields, &msgsourceOff);
+                OutputDebugPrintf("[Add2DB] CollectContentFields found %llu fields", (unsigned long long)fields.size());
+
+                if (content.empty())
+                {
+                    content = PickContentField(fields, msgsourceOff);
+                    OutputDebugPrintf("[Add2DB] PickContentField result: [%s]", content.c_str());
+                }
+
+                // 如果没有找到内容，尝试深度扫描
+                if (content.empty())
+                {
+                    OutputDebugPrintf("[Add2DB] Content empty, trying deep scan...");
+                    fields.clear();
+                    int nested = 0;
+                    for (size_t off = 0; off + 8 <= 0x200 && nested < 6; off += 8)
+                    {
+                        std::string occupied;
+                        if (off + sizeof(StdString) <= 0x200 &&
+                            ReadMsStdString((StdString *)(arg_msg + off), occupied) && !occupied.empty())
+                        {
+                            continue;
+                        }
+                        uint64_t child = 0;
+                        if (!SafeReadBytes((void *)(arg_msg + off), &child, 8))
+                            continue;
+                        if (child == arg_msg || !LooksLikeHeapObject(child))
+                            continue;
+                        CollectContentFields(child, 0x400, msgType, fields, nullptr);
+                        nested += 1;
+                    }
+                    content = PickContentField(fields, (size_t)-1);
+                    OutputDebugPrintf("[Add2DB] Deep scan result: [%s]", content.c_str());
+                }
+
+                // 如果还是没有内容，用消息类型占位符
+                if (content.empty() && msgType != 0 && msgType != 1)
+                {
+                    content = revoke_tip::messageKindPlaceholder(msgType);
+                    OutputDebugPrintf("[Add2DB] Using placeholder: [%s]", content.c_str());
+                }
+
+                // 尝试提取发送者名称（从 wxid 字段或其他标识）
+                for (size_t offset = 0; offset + sizeof(StdString) <= 0x300; offset += 8)
+                {
+                    StdString *ss = (StdString *)(arg_msg + offset);
+                    std::string value;
+                    if (ReadMsStdString(ss, value) && !value.empty())
+                    {
+                        // 查找看起来像 wxid 的字段作为发送者标识
+                        if (revoke_tip::looksLikeWxId(value))
+                        {
+                            from_name = value;
+                            OutputDebugPrintf("[Add2DB] Found wxid: [%s]", from_name.c_str());
+                            break;
+                        }
+                    }
+                }
+
+                // 发送通知
+                if (!content.empty())
+                {
+                    OutputDebugPrintf("[Add2DB] Calling SendWindowsNotification...");
+                    SendWindowsNotification(from_name, content);
+                }
+                else
+                {
+                    OutputDebugPrintf("[Add2DB] Content is empty, skip notification");
+                }
+            }
+            else
+            {
+                OutputDebugPrintf("[Add2DB] Message object not readable or null");
+            }
+        }
+
+        if (!was_anti_revoke)
             return;
 
         if (!g_config_info.add2db_info.initialized)
@@ -1886,10 +2835,26 @@ BOOL APIENTRY DllMain( HMODULE hModule,
         else
             OutputDebugPrintf("[RevokeHook] AddBp %p OK", g_bpDelMsg);
 
+        DiscoverAdd2DBTargetBreakpoint();
+
         if (VehBp_Set(g_bpAdd2DB, OnTargetHit) == -1)
             OutputDebugPrintf("[RevokeHook] AddBp %p Error", g_bpAdd2DB);
         else
             OutputDebugPrintf("[RevokeHook] AddBp %p OK", g_bpAdd2DB);
+
+        // 初始化 IAT Hook 来拦截通知 API
+        OutputDebugPrintf("[RevokeHook] g_notify_new_message = %d", g_notify_new_message);
+        if (g_notify_new_message)
+        {
+            if (InitNotifyIatHook())
+                OutputDebugPrintf("[RevokeHook] Shell_NotifyIconW hook enabled");
+            else
+                OutputDebugPrintf("[RevokeHook] Shell_NotifyIconW hook unavailable");
+        }
+        else
+        {
+            OutputDebugPrintf("[RevokeHook] Skipping inline hooks (notify_new_message is disabled)");
+        }
 
         break;
     case DLL_THREAD_ATTACH:
