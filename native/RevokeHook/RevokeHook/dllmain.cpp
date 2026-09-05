@@ -24,11 +24,13 @@
 static HANDLE g_hLogFile = INVALID_HANDLE_VALUE;
 
 // Balloon notification bridge
-extern "C" void SendWindowsNotification(const char* from_utf8, const char* content_utf8);
+extern "C" void SendWindowsNotificationWithAvatar(const char* from_utf8,
+    const char* content_utf8, const char* avatar_url_utf8);
 bool InitNotifyIatHook();
 extern "C" void ObserveFlashWindowEx(uintptr_t return_address,
     const FLASHWINFO *flash_info, uint64_t caller_rdi);
-static void SendWindowsNotification(const std::string &from, const std::string &content);
+static void SendWindowsNotification(const std::string &from, const std::string &content,
+    const std::string &avatar_url);
 
 //VEH + INT3断点
 static void* g_bpDelMsg = nullptr;
@@ -1072,7 +1074,7 @@ static uint8_t *PeSection(HMODULE mod, const char *name, size_t *out_size)
 static void OnTargetHit(PCONTEXT ctx, PEXCEPTION_RECORD pExc);
 static bool CaptureNotifyMessage(uint64_t message_object, uint64_t content_arg,
     uint64_t auxiliary_object, std::string &from, std::string &content,
-    bool flash_layout = false);
+    bool flash_layout = false, std::string *avatar_url = nullptr);
 
 static bool IsFlashCallerBreakpoint(uint64_t rip)
 {
@@ -1291,6 +1293,7 @@ extern "C" void ObserveFlashWindowEx(uintptr_t return_address,
 
     std::string from;
     std::string content;
+    std::string avatar_url;
     bool captured = false;
     // RDI 的通知对象是当前 Flash 事件的同一份现场数据，优先级高于
     // 可能来自其它线程/上一条消息的 Add2DB 暂存候选。
@@ -1304,7 +1307,7 @@ extern "C" void ObserveFlashWindowEx(uintptr_t return_address,
             0,
             from,
             content,
-            true);
+            true, &avatar_url);
         OutputDebugPrintf("[FlashProbe] caller candidate captured=%d from=[%s] content=[%s]",
             captured ? 1 : 0, from.c_str(), content.c_str());
     }
@@ -1312,13 +1315,14 @@ extern "C" void ObserveFlashWindowEx(uintptr_t return_address,
     if (!captured && caller_rdi != 0)
     {
         captured = CaptureNotifyMessage(
-            caller_rdi, 0, 0, from, content, true);
+            caller_rdi, 0, 0, from, content, true, &avatar_url);
         OutputDebugPrintf("[FlashProbe] hook-context candidate rdi=%p captured=%d from=[%s] content=[%s]",
             (void *)caller_rdi, captured ? 1 : 0, from.c_str(), content.c_str());
     }
 
     if (!captured && pending_fresh)
     {
+        avatar_url.clear();
         from = state->pending_notify_from;
         content = state->pending_notify_content;
         captured = !content.empty();
@@ -1346,7 +1350,7 @@ extern "C" void ObserveFlashWindowEx(uintptr_t return_address,
     {
         OutputDebugPrintf("[FlashProbe] sending notification from=[%s] content=[%s]",
             from.c_str(), content.c_str());
-        SendWindowsNotification(from, content);
+        SendWindowsNotification(from, content, avatar_url);
     }
 
     if (state->flash_caller.valid)
@@ -1974,7 +1978,8 @@ static std::string PickContentField(const std::vector<ContentField> &fields, siz
  * @param from 发送者名称
  * @param content 消息内容
  */
-static void SendWindowsNotification(const std::string &from, const std::string &content)
+static void SendWindowsNotification(const std::string &from, const std::string &content,
+    const std::string &avatar_url)
 {
     OutputDebugPrintf("[Notification] SendWindowsNotification called, g_notify_new_message=%d", g_notify_new_message);
 
@@ -1993,7 +1998,7 @@ static void SendWindowsNotification(const std::string &from, const std::string &
     body = revoke_tip::truncateUtf8(body, 200);
 
     // 调用 inline_hook.cpp 的 Toast 显示
-    SendWindowsNotification(title.c_str(), body.c_str());
+    SendWindowsNotificationWithAvatar(title.c_str(), body.c_str(), avatar_url.c_str());
 }
 
 static std::string CaptureOriginalText(uint64_t base)
@@ -2048,10 +2053,12 @@ static void CopyNotifyField(char *dst, size_t dst_size, const std::string &value
 
 static bool CaptureNotifyMessage(uint64_t message_object, uint64_t content_arg,
     uint64_t auxiliary_object, std::string &from, std::string &content,
-    bool flash_layout)
+    bool flash_layout, std::string *avatar_url)
 {
     from.clear();
     content.clear();
+    if (avatar_url)
+        avatar_url->clear();
     if (message_object == 0 || !IsMemoryReadable((void *)message_object, 0x100))
         return false;
 
@@ -2160,6 +2167,14 @@ static bool CaptureNotifyMessage(uint64_t message_object, uint64_t content_arg,
     {
         std::string nickname;
         std::string wxid;
+        std::string avatar;
+        if (avatar_url && read_field(0x140, avatar) && avatar.size() < 2048 &&
+            avatar.find('\0') == std::string::npos &&
+            (_strnicmp(avatar.c_str(), "https://", 8) == 0 ||
+             _strnicmp(avatar.c_str(), "http://", 7) == 0))
+        {
+            *avatar_url = avatar;
+        }
         if (read_field(0x160, nickname) && LooksLikePlainText(nickname) &&
             !revoke_tip::looksLikeWxId(nickname))
         {
@@ -2603,11 +2618,18 @@ static void OnTargetHit(PCONTEXT ctx, PEXCEPTION_RECORD /*pExc*/)
                     }
                 }
 
-                // 发送通知
+                // Flash caller supplies the current sender and avatar before displaying.
                 if (!content.empty())
                 {
-                    OutputDebugPrintf("[Add2DB] Calling SendWindowsNotification...");
-                    SendWindowsNotification(from_name, content);
+                    thread_state->pending_notify_msg = arg_msg;
+                    thread_state->pending_notify_content_arg = arg_content;
+                    thread_state->pending_notify_tick = GetTickCount();
+                    CopyNotifyField(thread_state->pending_notify_from,
+                        sizeof(thread_state->pending_notify_from), from_name);
+                    CopyNotifyField(thread_state->pending_notify_content,
+                        sizeof(thread_state->pending_notify_content), content);
+                    thread_state->pending_notify_valid = 1;
+                    OutputDebugPrintf("[Add2DB] Candidate saved for Flash notification");
                 }
                 else
                 {

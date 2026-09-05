@@ -4,9 +4,17 @@
 #include <cstdio>
 #include <cstring>
 #include <delayimp.h>
+#include <objidl.h>
+#include <gdiplus.h>
 #include <intrin.h>
 #include <shellapi.h>
 #include <string>
+#include <vector>
+#include <winhttp.h>
+
+#pragma comment(lib, "gdiplus.lib")
+#pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "winhttp.lib")
 
 // 外部日志函数
 extern void OutputDebugPrintf(const char* fmt, ...);
@@ -21,6 +29,7 @@ struct NotificationParams
 {
     wchar_t from[256];
     wchar_t content[512];
+    wchar_t avatarUrl[2048];
 };
 
 // 只保留一个待显示的通知，避免锁屏期间向 Shell 累积气泡。
@@ -29,6 +38,152 @@ static NotificationParams g_pendingNotification = {};
 static bool g_pendingNotificationValid = false;
 static HANDLE g_notificationEvent = nullptr;
 static volatile LONG g_notificationWorkerRunning = 0;
+
+static bool DownloadAvatarBytes(const wchar_t *url, std::vector<BYTE> &bytes)
+{
+    bytes.clear();
+    if (url == nullptr || url[0] == L'\0' || wcslen(url) >= 2048)
+        return false;
+
+    wchar_t hostName[256] = {};
+    wchar_t urlPath[2048] = {};
+    wchar_t extraInfo[2048] = {};
+    URL_COMPONENTS parts = {};
+    parts.dwStructSize = sizeof(parts);
+    parts.lpszHostName = hostName;
+    parts.dwHostNameLength = _countof(hostName);
+    parts.lpszUrlPath = urlPath;
+    parts.dwUrlPathLength = _countof(urlPath);
+    parts.lpszExtraInfo = extraInfo;
+    parts.dwExtraInfoLength = _countof(extraInfo);
+    if (!WinHttpCrackUrl(url, 0, 0, &parts) ||
+        (parts.nScheme != INTERNET_SCHEME_HTTP &&
+         parts.nScheme != INTERNET_SCHEME_HTTPS) || parts.dwHostNameLength == 0)
+    {
+        return false;
+    }
+
+    std::wstring objectName = parts.dwUrlPathLength == 0 ? L"/" : urlPath;
+    if (parts.dwExtraInfoLength != 0)
+        objectName.append(parts.lpszExtraInfo, parts.dwExtraInfoLength);
+
+    HINTERNET session = WinHttpOpen(L"WeChatAntiRecall/1.0",
+        WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME,
+        WINHTTP_NO_PROXY_BYPASS, 0);
+    if (session == nullptr)
+        return false;
+    WinHttpSetTimeouts(session, 1500, 1500, 2500, 2500);
+
+    HINTERNET connection = WinHttpConnect(session, hostName, parts.nPort, 0);
+    HINTERNET request = connection == nullptr ? nullptr : WinHttpOpenRequest(
+        connection, L"GET", objectName.c_str(), nullptr, WINHTTP_NO_REFERER,
+        WINHTTP_DEFAULT_ACCEPT_TYPES,
+        parts.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0);
+    bool ok = false;
+    const ULONGLONG started = GetTickCount64();
+    if (request != nullptr && WinHttpSendRequest(request, WINHTTP_NO_ADDITIONAL_HEADERS,
+        0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) && WinHttpReceiveResponse(request, nullptr))
+    {
+        DWORD status = 0;
+        DWORD statusSize = sizeof(status);
+        if (WinHttpQueryHeaders(request, WINHTTP_QUERY_STATUS_CODE |
+            WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &status,
+            &statusSize, WINHTTP_NO_HEADER_INDEX) && status >= 200 && status < 300)
+        {
+            constexpr size_t kMaxAvatarBytes = 4 * 1024 * 1024;
+            BYTE chunk[8192];
+            while (GetTickCount64() - started < 5000)
+            {
+                DWORD read = 0;
+                if (!WinHttpReadData(request, chunk, sizeof(chunk), &read) ||
+                    bytes.size() + read > kMaxAvatarBytes)
+                    break;
+                if (read == 0)
+                {
+                    ok = !bytes.empty();
+                    break;
+                }
+                bytes.insert(bytes.end(), chunk, chunk + read);
+            }
+        }
+    }
+    if (request != nullptr)
+        WinHttpCloseHandle(request);
+    if (connection != nullptr)
+        WinHttpCloseHandle(connection);
+    WinHttpCloseHandle(session);
+    if (!ok)
+        bytes.clear();
+    return ok;
+}
+
+static HICON DecodeAvatarIcon(const std::vector<BYTE> &bytes)
+{
+    if (bytes.empty())
+        return nullptr;
+
+    HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, bytes.size());
+    if (memory == nullptr)
+        return nullptr;
+    void *buffer = GlobalLock(memory);
+    if (buffer == nullptr)
+    {
+        GlobalFree(memory);
+        return nullptr;
+    }
+    memcpy(buffer, bytes.data(), bytes.size());
+    GlobalUnlock(memory);
+
+    IStream *stream = nullptr;
+    if (CreateStreamOnHGlobal(memory, TRUE, &stream) != S_OK)
+    {
+        GlobalFree(memory);
+        return nullptr;
+    }
+
+    Gdiplus::GdiplusStartupInput startupInput;
+    ULONG_PTR token = 0;
+    HICON icon = nullptr;
+    if (Gdiplus::GdiplusStartup(&token, &startupInput, nullptr) == Gdiplus::Ok)
+    {
+        {
+            Gdiplus::Bitmap bitmap(stream, FALSE);
+            const UINT width = bitmap.GetWidth();
+            const UINT height = bitmap.GetHeight();
+            if (bitmap.GetLastStatus() == Gdiplus::Ok && width > 0 && height > 0 &&
+                width <= 2048 && height <= 2048)
+            {
+                const int size = GetSystemMetrics(SM_CXICON);
+                Gdiplus::Bitmap scaled(size, size, PixelFormat32bppARGB);
+                Gdiplus::Graphics graphics(&scaled);
+                graphics.Clear(Gdiplus::Color(0, 0, 0, 0));
+                graphics.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+                const float scale = static_cast<float>(size) / (width > height ? width : height);
+                const float w = width * scale;
+                const float h = height * scale;
+                if (graphics.DrawImage(&bitmap, (size - w) / 2, (size - h) / 2, w, h) == Gdiplus::Ok)
+                    scaled.GetHICON(&icon);
+            }
+        }
+        Gdiplus::GdiplusShutdown(token);
+    }
+    stream->Release();
+    return icon;
+}
+
+static HICON LoadAvatarIcon(const wchar_t *url)
+{
+    std::vector<BYTE> bytes;
+    if (!DownloadAvatarBytes(url, bytes))
+    {
+        OutputDebugPrintf("[Toast] Avatar download failed");
+        return nullptr;
+    }
+    HICON icon = DecodeAvatarIcon(bytes);
+    if (icon == nullptr)
+        OutputDebugPrintf("[Toast] Avatar decode failed");
+    return icon;
+}
 
 static bool IsWorkstationLocked()
 {
@@ -72,15 +227,19 @@ static LRESULT CALLBACK NotificationWindowProc(HWND hWnd, UINT message,
 
 static DWORD WINAPI NotificationThread(LPVOID param)
 {
+    HWND hWnd = nullptr;
+    HICON hIconTray = nullptr;
+    HICON hIconBalloon = nullptr;
+    HICON hAvatar = nullptr;
+    wchar_t avatarUrl[2048] = {};
+    bool ownsTrayIcon = false;
+    bool ownsBalloonIcon = false;
+    NOTIFYICONDATAW nid = {};
+    bool iconAdded = false;
     __try
     {
         (void)param;
 
-        HWND hWnd = nullptr;
-        HICON hIconTray = nullptr;
-        HICON hIconBalloon = nullptr;
-        NOTIFYICONDATAW nid = {};
-        bool iconAdded = false;
         DWORD balloonEnd = 0;
 
         for (;;)
@@ -123,32 +282,28 @@ static DWORD WINAPI NotificationThread(LPVOID param)
                             SetWindowLongPtrW(hWnd, GWLP_WNDPROC,
                                 reinterpret_cast<LONG_PTR>(NotificationWindowProc));
 
-                            // 获取 DLL 所在目录的 IcoE.ico
-                            wchar_t iconPath[MAX_PATH] = {0};
+                            wchar_t iconPath[MAX_PATH] = {};
                             HMODULE hModule = nullptr;
                             if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
                                 GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                                 (LPCWSTR)&NotificationThread, &hModule) && hModule)
                             {
-                                GetModuleFileNameW(hModule, iconPath, MAX_PATH);
-                                wchar_t* lastSlash = wcsrchr(iconPath, L'\\');
-                                if (lastSlash)
+                                DWORD length = GetModuleFileNameW(hModule, iconPath, MAX_PATH);
+                                wchar_t *lastSlash = wcsrchr(iconPath, L'\\');
+                                if (length > 0 && length < MAX_PATH && lastSlash &&
+                                    wcscpy_s(lastSlash + 1, MAX_PATH - (lastSlash + 1 - iconPath),
+                                        L"IcoE.ico") == 0)
                                 {
-                                    wcscpy_s(lastSlash + 1,
-                                        MAX_PATH - (lastSlash + 1 - iconPath), L"IcoE.ico");
+                                    hIconTray = (HICON)LoadImageW(nullptr, iconPath,
+                                        IMAGE_ICON, 16, 16, LR_LOADFROMFILE);
+                                    hIconBalloon = (HICON)LoadImageW(nullptr, iconPath,
+                                        IMAGE_ICON, 32, 32, LR_LOADFROMFILE);
                                 }
                             }
-
-                            // 加载图标
-                            if (iconPath[0] &&
-                                GetFileAttributesW(iconPath) != INVALID_FILE_ATTRIBUTES)
-                            {
-                                hIconTray = (HICON)LoadImageW(nullptr, iconPath,
-                                    IMAGE_ICON, 16, 16, LR_LOADFROMFILE);
-                                hIconBalloon = (HICON)LoadImageW(nullptr, iconPath,
-                                    IMAGE_ICON, 32, 32, LR_LOADFROMFILE);
-                                OutputDebugPrintf("[Toast] Loading icon from: %S", iconPath);
-                            }
+                            ownsTrayIcon = hIconTray != nullptr;
+                            ownsBalloonIcon = hIconBalloon != nullptr;
+                            if (hIconTray != nullptr || hIconBalloon != nullptr)
+                                OutputDebugPrintf("[Toast] Loading fallback icon from DLL directory");
 
                             if (!hIconTray)
                             {
@@ -173,7 +328,32 @@ static DWORD WINAPI NotificationThread(LPVOID param)
 
                     if (hWnd && hIconTray)
                     {
+                        if (wcscmp(avatarUrl, np.avatarUrl) != 0 ||
+                            (hAvatar == nullptr && np.avatarUrl[0] != L'\0'))
+                        {
+                            if (hAvatar)
+                                DestroyIcon(hAvatar);
+                            hAvatar = nullptr;
+                            wcscpy_s(avatarUrl, np.avatarUrl);
+                            if (avatarUrl[0] != L'\0')
+                                hAvatar = LoadAvatarIcon(avatarUrl);
+                        }
+
+                        // Downloading may span a lock event or a newer queued message.
+                        const bool locked = IsWorkstationLocked();
+                        AcquireSRWLockExclusive(&g_notificationLock);
+                        const bool superseded = g_pendingNotificationValid;
+                        if (locked && !superseded)
+                        {
+                            g_pendingNotification = np;
+                            g_pendingNotificationValid = true;
+                        }
+                        ReleaseSRWLockExclusive(&g_notificationLock);
+                        if (locked || superseded)
+                            continue;
+
                         // 每次只保留同一个托盘图标，新的消息替换旧的气泡。
+                        nid.hIcon = hAvatar ? hAvatar : hIconTray;
                         nid.uFlags = NIF_ICON | NIF_TIP | NIF_MESSAGE;
                         nid.uVersion = 0;
                         if (Shell_NotifyIconW(NIM_ADD, &nid))
@@ -195,7 +375,8 @@ static DWORD WINAPI NotificationThread(LPVOID param)
                                 sizeof(nid.szInfo) / sizeof(nid.szInfo[0]),
                                 np.content, _TRUNCATE);
                             nid.dwInfoFlags = NIIF_USER | NIIF_LARGE_ICON;
-                            nid.hBalloonIcon = hIconBalloon;
+                            nid.hBalloonIcon = hAvatar ? hAvatar : hIconBalloon;
+                            OutputDebugPrintf("[Toast] Icon source: %s", hAvatar ? "avatar" : "fallback");
 
                             if (!Shell_NotifyIconW(NIM_MODIFY, &nid))
                             {
@@ -226,6 +407,7 @@ static DWORD WINAPI NotificationThread(LPVOID param)
                     Shell_NotifyIconW(NIM_DELETE, &nid);
                     iconAdded = false;
                 }
+
             }
 
             HANDLE event = g_notificationEvent;
@@ -238,35 +420,51 @@ static DWORD WINAPI NotificationThread(LPVOID param)
                 Sleep(250);
             }
         }
+
     }
     __except(EXCEPTION_EXECUTE_HANDLER)
     {
         OutputDebugPrintf("[Toast] Exception in notification thread: 0x%X", GetExceptionCode());
-        InterlockedExchange(&g_notificationWorkerRunning, 0);
-        return 1;
     }
+    if (iconAdded)
+        Shell_NotifyIconW(NIM_DELETE, &nid);
+    if (hAvatar)
+        DestroyIcon(hAvatar);
+    if (ownsBalloonIcon)
+        DestroyIcon(hIconBalloon);
+    if (ownsTrayIcon)
+        DestroyIcon(hIconTray);
+    if (hWnd)
+        DestroyWindow(hWnd);
+    InterlockedExchange(&g_notificationWorkerRunning, 0);
+    return 1;
 }
 
-static void ShowNotification(const char* from, const char* content)
+static void ShowNotification(const char* from, const char* content,
+    const char* avatar_url = nullptr)
 {
-    DWORD now = GetTickCount();
     const bool locked = IsWorkstationLocked();
-    if (!locked && now - g_LastNotifyTime < 3000)
-    {
-        return;
-    }
-    if (!locked)
-        g_LastNotifyTime = now;
 
     NotificationParams np = {};
 
     // 转换 UTF-8 到 UTF-16
     MultiByteToWideChar(CP_UTF8, 0, from ? from : "WeChat", -1, np.from, 256);
     MultiByteToWideChar(CP_UTF8, 0, content ? content : "New Message", -1, np.content, 512);
+    if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+        avatar_url ? avatar_url : "", -1, np.avatarUrl, _countof(np.avatarUrl)))
+        np.avatarUrl[0] = L'\0';
 
     bool startWorker = false;
     HANDLE event = nullptr;
     AcquireSRWLockExclusive(&g_notificationLock);
+    const DWORD now = GetTickCount();
+    if (!locked && now - g_LastNotifyTime < 3000)
+    {
+        ReleaseSRWLockExclusive(&g_notificationLock);
+        return;
+    }
+    if (!locked)
+        g_LastNotifyTime = now;
     g_pendingNotification = np;
     g_pendingNotificationValid = true;
     if (g_notificationEvent == nullptr)
@@ -673,4 +871,10 @@ bool InitInlineHooks()
 extern "C" __declspec(dllexport) void SendWindowsNotification(const char* from, const char* content)
 {
     ShowNotification(from, content);
+}
+
+extern "C" __declspec(dllexport) void SendWindowsNotificationWithAvatar(
+    const char* from, const char* content, const char* avatar_url)
+{
+    ShowNotification(from, content, avatar_url);
 }
