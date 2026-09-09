@@ -30,6 +30,10 @@ struct NotificationParams
     wchar_t from[256];
     wchar_t content[512];
     wchar_t avatarUrl[2048];
+    char conversation[128];
+    HWND chatWindow;
+    DWORD chatThread;
+    UINT id;
 };
 
 // 只保留一个待显示的通知，避免锁屏期间向 Shell 累积气泡。
@@ -38,6 +42,173 @@ static NotificationParams g_pendingNotification = {};
 static bool g_pendingNotificationValid = false;
 static HANDLE g_notificationEvent = nullptr;
 static volatile LONG g_notificationWorkerRunning = 0;
+static UINT g_openChatMessage = 0;
+static HHOOK g_openChatHook = nullptr;
+static NotificationParams g_requestedChat = {};
+
+static void OpenNativeChat(const char *username)
+{
+    __try
+    {
+        auto *base = reinterpret_cast<BYTE *>(GetModuleHandleW(L"Weixin.dll"));
+        if (!base || !username[0])
+            return;
+        auto *dos = reinterpret_cast<IMAGE_DOS_HEADER *>(base);
+        auto *nt = reinterpret_cast<IMAGE_NT_HEADERS64 *>(base + dos->e_lfanew);
+        // Native unread-popup route, verified against WeChat 4.1.9.57 x64.
+        if (nt->FileHeader.TimeDateStamp != 0x6A0714C7 ||
+            nt->OptionalHeader.SizeOfImage != 0xAD92000 ||
+            memcmp(base + 0x167FB0, "\x55\x41\x57\x41\x56\x56\x57\x53\x48\x83\xEC\x78", 12) != 0)
+        {
+            OutputDebugPrintf("[Chat] Unsupported Weixin.dll build; native navigation skipped");
+            return;
+        }
+        void *app = *reinterpret_cast<void **>(base + 0xA6C44C0);
+        if (!app)
+            return;
+        void *root = reinterpret_cast<void *(*)(void *)>(base + 0x16A510)(app);
+        if (!root)
+            return;
+        void *service = reinterpret_cast<void *(*)(void *)>(base + 0x8B3140)(root);
+        if (!service)
+            return;
+        struct NativeString
+        {
+            union { char inlineData[16]; char *data; } storage;
+            size_t size, capacity;
+        } name = {};
+        name.size = strlen(username);
+        name.capacity = name.size < 16 ? 15 : name.size;
+        if (name.size < 16)
+            memcpy(name.storage.inlineData, username, name.size + 1);
+        else
+            name.storage.data = const_cast<char *>(username);
+        void *window = reinterpret_cast<void *(*)(void *, const NativeString *)>(
+            base + 0x1EBF720)(service, &name);
+        if (window)
+        {
+            if (reinterpret_cast<bool (*)(void *)>(base + 0x7C52F0)(window))
+                reinterpret_cast<void (*)(void *)>(base + 0x4FF9C0)(window);
+            reinterpret_cast<void (*)(void *)>(base + 0x4FF8B0)(window);
+            reinterpret_cast<void (*)(void *)>(base + 0x50AC60)(window);
+        }
+        else
+        {
+            // The native callee consumes this MSVC string and frees its buffer.
+            if (name.size >= 16)
+            {
+                name.storage.data = reinterpret_cast<char *(*)(size_t)>(
+                    base + 0x659FDAC)(name.capacity + 1);
+                if (!name.storage.data)
+                    return;
+                memcpy(name.storage.data, username, name.size + 1);
+            }
+            uintptr_t message[2] = {};
+            reinterpret_cast<void (*)(void *, NativeString *, void *, bool, bool)>(
+                base + 0x167FB0)(app, &name, message, true, false);
+        }
+        OutputDebugPrintf("[Chat] Native navigation returned: username=%s thread=%lu detached=%d",
+            username, GetCurrentThreadId(), window ? 1 : 0);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        OutputDebugPrintf("[Chat] Native navigation exception: 0x%X", GetExceptionCode());
+    }
+}
+
+struct FindWindowOnThreadContext
+{
+    DWORD thread;
+    HWND hwnd;
+};
+
+static BOOL CALLBACK FindWindowOnThread(HWND hwnd, LPARAM lParam)
+{
+    auto *ctx = reinterpret_cast<FindWindowOnThreadContext *>(lParam);
+    DWORD pid = 0;
+    if (GetWindowThreadProcessId(hwnd, &pid) == ctx->thread && pid == GetCurrentProcessId())
+    {
+        ctx->hwnd = hwnd;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static LRESULT CALLBACK OpenChatCallWndProc(int code, WPARAM wParam, LPARAM lParam)
+{
+    auto *message = reinterpret_cast<CWPSTRUCT *>(lParam);
+    if (code == HC_ACTION && message->message == g_openChatMessage)
+    {
+        char username[128] = {};
+        AcquireSRWLockExclusive(&g_notificationLock);
+        if (message->hwnd == g_requestedChat.chatWindow && message->wParam == g_requestedChat.id)
+        {
+            strcpy_s(username, g_requestedChat.conversation);
+            g_requestedChat.conversation[0] = '\0';
+            UnhookWindowsHookEx(g_openChatHook);
+            g_openChatHook = nullptr;
+        }
+        ReleaseSRWLockExclusive(&g_notificationLock);
+        if (username[0])
+            OpenNativeChat(username);
+    }
+    return CallNextHookEx(nullptr, code, wParam, lParam);
+}
+
+static void RequestOpenChat(const NotificationParams &notification)
+{
+    HWND hwnd = notification.chatWindow;
+    DWORD process = 0;
+    DWORD thread = GetWindowThreadProcessId(hwnd, &process);
+    if (!hwnd || !IsWindow(hwnd) || process != GetCurrentProcessId())
+    {
+        FindWindowOnThreadContext ctx = { notification.chatThread, nullptr };
+        if (ctx.thread)
+            EnumWindows(FindWindowOnThread, reinterpret_cast<LPARAM>(&ctx));
+        hwnd = ctx.hwnd;
+        thread = hwnd ? GetWindowThreadProcessId(hwnd, &process) : 0;
+    }
+    if (!hwnd || !thread || process != GetCurrentProcessId() || !notification.conversation[0])
+    {
+        OutputDebugPrintf("[Chat] Notification has no valid conversation target");
+        ShellExecuteW(nullptr, L"open", L"weixin://", nullptr, nullptr, SW_SHOWNORMAL);
+        return;
+    }
+
+    HMODULE module = nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+        GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        reinterpret_cast<LPCWSTR>(&OpenChatCallWndProc), &module);
+    AcquireSRWLockExclusive(&g_notificationLock);
+    if (!g_openChatMessage)
+        g_openChatMessage = RegisterWindowMessageW(L"WeChatAntiRecall.OpenChat.v1");
+    if (g_openChatHook)
+        UnhookWindowsHookEx(g_openChatHook);
+    g_requestedChat = notification;
+    g_requestedChat.chatWindow = hwnd;
+    g_openChatHook = SetWindowsHookExW(WH_CALLWNDPROC, OpenChatCallWndProc, module, thread);
+    const UINT openMessage = g_openChatMessage;
+    const HHOOK hook = g_openChatHook;
+    ReleaseSRWLockExclusive(&g_notificationLock);
+
+    DWORD_PTR result = 0;
+    const BOOL sent = openMessage && hook &&
+        SendMessageTimeoutW(hwnd, openMessage, notification.id, 0,
+            SMTO_ABORTIFHUNG, 5000, &result);
+    if (!sent)
+    {
+        OutputDebugPrintf("[Chat] UI-thread dispatch failed: %lu", GetLastError());
+        AcquireSRWLockExclusive(&g_notificationLock);
+        if (g_openChatHook == hook)
+        {
+            UnhookWindowsHookEx(g_openChatHook);
+            g_openChatHook = nullptr;
+            g_requestedChat.conversation[0] = '\0';
+        }
+        ReleaseSRWLockExclusive(&g_notificationLock);
+        ShellExecuteW(nullptr, L"open", L"weixin://", nullptr, nullptr, SW_SHOWNORMAL);
+    }
+}
 
 static bool DownloadAvatarBytes(const wchar_t *url, std::vector<BYTE> &bytes)
 {
@@ -219,7 +390,16 @@ static LRESULT CALLBACK NotificationWindowProc(HWND hWnd, UINT message,
         (static_cast<UINT>(lParam) == NIN_BALLOONUSERCLICK ||
          static_cast<UINT>(LOWORD(lParam)) == NIN_BALLOONUSERCLICK))
     {
-        ShellExecuteW(nullptr, L"open", L"weixin://", nullptr, nullptr, SW_SHOWNORMAL);
+        auto *notification = reinterpret_cast<NotificationParams *>(
+            GetWindowLongPtrW(hWnd, GWLP_USERDATA));
+        const UINT id = HIWORD(lParam) ? HIWORD(lParam) : static_cast<UINT>(wParam);
+        if (notification && notification->id == id)
+        {
+            if (notification->conversation[0])
+                RequestOpenChat(*notification);
+            else
+                ShellExecuteW(nullptr, L"open", L"weixin://", nullptr, nullptr, SW_SHOWNORMAL);
+        }
         return 0;
     }
     return DefWindowProcW(hWnd, message, wParam, lParam);
@@ -236,6 +416,7 @@ static DWORD WINAPI NotificationThread(LPVOID param)
     bool ownsBalloonIcon = false;
     NOTIFYICONDATAW nid = {};
     bool iconAdded = false;
+    NotificationParams displayedNotification = {};
     __try
     {
         (void)param;
@@ -279,6 +460,8 @@ static DWORD WINAPI NotificationThread(LPVOID param)
                         }
                         else
                         {
+                            SetWindowLongPtrW(hWnd, GWLP_USERDATA,
+                                reinterpret_cast<LONG_PTR>(&displayedNotification));
                             SetWindowLongPtrW(hWnd, GWLP_WNDPROC,
                                 reinterpret_cast<LONG_PTR>(NotificationWindowProc));
 
@@ -354,6 +537,7 @@ static DWORD WINAPI NotificationThread(LPVOID param)
 
                         // 每次只保留同一个托盘图标，新的消息替换旧的气泡。
                         nid.hIcon = hAvatar ? hAvatar : hIconTray;
+                        nid.uID = nid.uID % 0xFFFF + 1;
                         nid.uFlags = NIF_ICON | NIF_TIP | NIF_MESSAGE;
                         nid.uVersion = 0;
                         if (Shell_NotifyIconW(NIM_ADD, &nid))
@@ -384,6 +568,8 @@ static DWORD WINAPI NotificationThread(LPVOID param)
                             }
                             else
                             {
+                                displayedNotification = np;
+                                displayedNotification.id = nid.uID;
                                 OutputDebugPrintf("[Toast] Balloon tip displayed");
                             }
                             balloonEnd = GetTickCount() + 6000;
@@ -441,11 +627,16 @@ static DWORD WINAPI NotificationThread(LPVOID param)
 }
 
 static void ShowNotification(const char* from, const char* content,
-    const char* avatar_url = nullptr)
+    const char* avatar_url = nullptr, const char* conversation = nullptr,
+    HWND chat_window = nullptr)
 {
     const bool locked = IsWorkstationLocked();
 
     NotificationParams np = {};
+    if (conversation && strlen(conversation) < sizeof(np.conversation))
+        strcpy_s(np.conversation, conversation);
+    np.chatWindow = chat_window;
+    np.chatThread = chat_window ? GetWindowThreadProcessId(chat_window, nullptr) : 0;
 
     // 转换 UTF-8 到 UTF-16
     MultiByteToWideChar(CP_UTF8, 0, from ? from : "WeChat", -1, np.from, 256);
@@ -877,4 +1068,11 @@ extern "C" __declspec(dllexport) void SendWindowsNotificationWithAvatar(
     const char* from, const char* content, const char* avatar_url)
 {
     ShowNotification(from, content, avatar_url);
+}
+
+extern "C" __declspec(dllexport) void SendWindowsNotificationForChat(
+    const char* from, const char* content, const char* avatar_url,
+    const char* conversation, HWND chat_window)
+{
+    ShowNotification(from, content, avatar_url, conversation, chat_window);
 }
