@@ -19,7 +19,7 @@
 // 外部日志函数
 extern void OutputDebugPrintf(const char* fmt, ...);
 extern "C" void ObserveFlashWindowEx(uintptr_t return_address,
-    const FLASHWINFO *flash_info, uint64_t caller_rdi);
+    const FLASHWINFO *flash_info, const CONTEXT *hook_context);
 
 // 防止频繁通知
 static DWORD g_LastNotifyTime = 0;
@@ -890,7 +890,7 @@ static BOOL WINAPI HookedFlashWindowEx(PFLASHWINFO pfwi)
     CONTEXT hook_context;
     RtlCaptureContext(&hook_context);
     const uintptr_t return_address = reinterpret_cast<uintptr_t>(_ReturnAddress());
-    ObserveFlashWindowEx(return_address, pfwi, hook_context.Rdi);
+    ObserveFlashWindowEx(return_address, pfwi, &hook_context);
 
     OutputDebugPrintf("[Hook] FlashWindowEx called hwnd=%p flags=0x%X count=%u",
         pfwi ? pfwi->hwnd : nullptr, pfwi ? pfwi->dwFlags : 0,

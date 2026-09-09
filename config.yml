@@ -20,7 +20,7 @@ debug: true
 notify_new_message: true
 
 # Dump every unique message object/argument to RevokeHook.log for offset analysis
-notify_dump_all: true
+notify_dump_all: false
 
 # Send this exact text once to locate the正文 std::string field in the dump
 notify_probe_text: "__WA_NOTIFY_PROBE_7F3A__"

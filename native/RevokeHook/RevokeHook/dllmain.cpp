@@ -29,7 +29,7 @@ extern "C" void SendWindowsNotificationForChat(const char* from_utf8,
     const char* conversation_utf8, HWND chat_window);
 bool InitNotifyIatHook();
 extern "C" void ObserveFlashWindowEx(uintptr_t return_address,
-    const FLASHWINFO *flash_info, uint64_t caller_rdi);
+    const FLASHWINFO *flash_info, const CONTEXT *hook_context);
 static void SendWindowsNotification(const std::string &from, const std::string &content,
     const std::string &avatar_url, const std::string &conversation, HWND chat_window);
 
@@ -1265,8 +1265,205 @@ static bool ReadFlashWindowInfoSafe(const FLASHWINFO *flash_info,
     }
 }
 
+static constexpr int kRecentNotifySlots = 8;
+struct RecentNotifySlot
+{
+    DWORD tick;
+    uint8_t used;
+    char from[256];
+    char content[1024];
+    char avatar[2048];
+    char conversation[128];
+};
+static SRWLOCK g_recentNotifyLock = SRWLOCK_INIT;
+static RecentNotifySlot g_recentNotify[kRecentNotifySlots] = {};
+
+static void RememberRecentNotify(const std::string &from, const std::string &content,
+    const std::string &avatar, const std::string &conversation)
+{
+    if (content.empty())
+        return;
+
+    AcquireSRWLockExclusive(&g_recentNotifyLock);
+    static int next = 0;
+    RecentNotifySlot &slot = g_recentNotify[next];
+    next = (next + 1) % kRecentNotifySlots;
+    slot.tick = GetTickCount();
+    slot.used = 0;
+    slot.from[0] = '\0';
+    slot.content[0] = '\0';
+    slot.avatar[0] = '\0';
+    slot.conversation[0] = '\0';
+    if (!from.empty())
+        strncpy_s(slot.from, from.c_str(), _TRUNCATE);
+    strncpy_s(slot.content, content.c_str(), _TRUNCATE);
+    if (!avatar.empty())
+        strncpy_s(slot.avatar, avatar.c_str(), _TRUNCATE);
+    if (!conversation.empty())
+        strncpy_s(slot.conversation, conversation.c_str(), _TRUNCATE);
+    ReleaseSRWLockExclusive(&g_recentNotifyLock);
+}
+
+static bool ConsumeRecentNotify(DWORD now, std::string &from, std::string &content,
+    std::string &avatar, std::string &conversation)
+{
+    AcquireSRWLockExclusive(&g_recentNotifyLock);
+    int best = -1;
+    DWORD best_age = 2001;
+    for (int i = 0; i < kRecentNotifySlots; i++)
+    {
+        RecentNotifySlot &slot = g_recentNotify[i];
+        if (slot.used || slot.content[0] == '\0')
+            continue;
+        const DWORD age = now - slot.tick;
+        if (age > 2000)
+            continue;
+        if (age < best_age)
+        {
+            best = i;
+            best_age = age;
+        }
+    }
+
+    bool ok = false;
+    if (best >= 0)
+    {
+        RecentNotifySlot &slot = g_recentNotify[best];
+        slot.used = 1;
+        from = slot.from;
+        content = slot.content;
+        avatar = slot.avatar;
+        conversation = slot.conversation;
+        ok = true;
+    }
+    ReleaseSRWLockExclusive(&g_recentNotifyLock);
+    return ok;
+}
+
+static size_t GetModuleImageSize(uint8_t *img)
+{
+    if (img == nullptr || !IsMemoryReadable(img, sizeof(IMAGE_DOS_HEADER)))
+        return 0;
+    auto *dos = reinterpret_cast<IMAGE_DOS_HEADER *>(img);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE)
+        return 0;
+    auto *nt = reinterpret_cast<IMAGE_NT_HEADERS64 *>(img + dos->e_lfanew);
+    if (!IsMemoryReadable(nt, sizeof(IMAGE_NT_HEADERS64)) || nt->Signature != IMAGE_NT_SIGNATURE)
+        return 0;
+    return nt->OptionalHeader.SizeOfImage;
+}
+
+static void AddNotifyCandidate(uint64_t *list, int *count, int cap, uint64_t value)
+{
+    if (list == nullptr || count == nullptr || value < 0x10000 || *count >= cap)
+        return;
+    if (!IsMemoryReadable(reinterpret_cast<void *>(value), 0x100))
+        return;
+    for (int i = 0; i < *count; i++)
+    {
+        if (list[i] == value)
+            return;
+    }
+    list[(*count)++] = value;
+}
+
+static void CollectContextCandidates(const CONTEXT *ctx, uint64_t *list, int *count, int cap)
+{
+    if (ctx == nullptr)
+        return;
+
+    AddNotifyCandidate(list, count, cap, ctx->Rdi);
+    AddNotifyCandidate(list, count, cap, ctx->Rsi);
+    AddNotifyCandidate(list, count, cap, ctx->Rbx);
+    AddNotifyCandidate(list, count, cap, ctx->Rbp);
+    AddNotifyCandidate(list, count, cap, ctx->R8);
+    AddNotifyCandidate(list, count, cap, ctx->R9);
+    AddNotifyCandidate(list, count, cap, ctx->Rcx);
+    AddNotifyCandidate(list, count, cap, ctx->Rdx);
+    AddNotifyCandidate(list, count, cap, ctx->R12);
+    AddNotifyCandidate(list, count, cap, ctx->R13);
+    AddNotifyCandidate(list, count, cap, ctx->R14);
+    AddNotifyCandidate(list, count, cap, ctx->R15);
+    AddNotifyCandidate(list, count, cap, ctx->Rax);
+
+    for (int off = 0x20; off <= 0xA0; off += 8)
+    {
+        uint64_t value = 0;
+        if (!SafeReadBytes(reinterpret_cast<void *>(ctx->Rsp + static_cast<uint64_t>(off)),
+            &value, sizeof(value)))
+            break;
+        AddNotifyCandidate(list, count, cap, value);
+    }
+}
+
+static int CollectUnwoundNotifyCandidates(const CONTEXT *start, uint64_t *list, int cap)
+{
+    int count = 0;
+    if (start == nullptr || list == nullptr || cap <= 0)
+        return 0;
+
+    CONTEXT ctx = *start;
+    uint8_t *img = reinterpret_cast<uint8_t *>(g_config_info.basic_info.imgbase);
+    const size_t img_size = GetModuleImageSize(img);
+    const uint64_t img_begin = reinterpret_cast<uint64_t>(img);
+    const uint64_t img_end = img_begin + img_size;
+
+    CollectContextCandidates(&ctx, list, &count, cap);
+
+    for (int frame = 0; frame < 10 && count < cap; frame++)
+    {
+        DWORD64 image_base = 0;
+        PRUNTIME_FUNCTION fn = RtlLookupFunctionEntry(ctx.Rip, &image_base, nullptr);
+        if (fn == nullptr)
+            break;
+
+        PVOID handler = nullptr;
+        DWORD64 establisher = 0;
+        RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, ctx.Rip, fn, &ctx, &handler, &establisher, nullptr);
+        if (ctx.Rip == 0)
+            break;
+
+        if (img_size != 0 && ctx.Rip >= img_begin && ctx.Rip < img_end)
+            CollectContextCandidates(&ctx, list, &count, cap);
+    }
+    return count;
+}
+
+static int ScoreNotifyCapture(const std::string &from, const std::string &content,
+    const std::string &avatar, const std::string &conversation)
+{
+    if (content.empty())
+        return 0;
+    int score = 2;
+    if (!conversation.empty())
+        score += 4;
+    if (!from.empty() && !revoke_tip::looksLikeWxId(from))
+        score += 3;
+    else if (!from.empty())
+        score += 1;
+    if (!avatar.empty())
+        score += 1;
+    return score;
+}
+
+static bool CaptureFromNotifyObject(uint64_t object, std::string &from, std::string &content,
+    std::string &avatar, std::string &conversation)
+{
+    from.clear();
+    content.clear();
+    avatar.clear();
+    conversation.clear();
+    if (object == 0)
+        return false;
+    if (CaptureNotifyMessage(object, 0, 0, from, content, true, &avatar, &conversation) &&
+        !content.empty())
+        return true;
+    return CaptureNotifyMessage(object, 0, 0, from, content, false, &avatar, &conversation) &&
+        !content.empty();
+}
+
 extern "C" void ObserveFlashWindowEx(uintptr_t return_address,
-    const FLASHWINFO *flash_info, uint64_t caller_rdi)
+    const FLASHWINFO *flash_info, const CONTEXT *hook_context)
 {
     EnsureFlashCallerBreakpoints(return_address);
 
@@ -1283,7 +1480,6 @@ extern "C" void ObserveFlashWindowEx(uintptr_t return_address,
         (void *)return_address, hwnd, flags, count,
         state->flash_caller.valid ? 1 : 0);
 
-    // 仅把任务栏闪烁作为新消息的时序锚点，避免其他窗口动画误触发。
     if ((flags & FLASHW_TRAY) == 0)
         return;
 
@@ -1298,29 +1494,67 @@ extern "C" void ObserveFlashWindowEx(uintptr_t return_address,
     std::string avatar_url;
     std::string conversation;
     bool captured = false;
-    // RDI 的通知对象是当前 Flash 事件的同一份现场数据，优先级高于
-    // 可能来自其它线程/上一条消息的 Add2DB 暂存候选。
+    const char *capture_source = nullptr;
+
     if (caller_fresh)
     {
-        // FlashWindowEx 的调用者现场中 RDI 指向通知消息对象；RBX 是
-        // 另一个内部对象，扫描它会得到加密串、配置项或旧对话内容。
-        captured = CaptureNotifyMessage(
-            state->flash_caller.rdi,
-            0,
-            0,
-            from,
-            content,
-            true, &avatar_url, &conversation);
+        captured = CaptureFromNotifyObject(
+            state->flash_caller.rdi, from, content, avatar_url, conversation);
+        if (captured)
+            capture_source = "veh-caller";
         OutputDebugPrintf("[FlashProbe] caller candidate captured=%d from=[%s] content=[%s]",
             captured ? 1 : 0, from.c_str(), content.c_str());
     }
 
-    if (!captured && caller_rdi != 0)
+    if (!captured && hook_context != nullptr)
     {
-        captured = CaptureNotifyMessage(
-            caller_rdi, 0, 0, from, content, true, &avatar_url, &conversation);
-        OutputDebugPrintf("[FlashProbe] hook-context candidate rdi=%p captured=%d from=[%s] content=[%s]",
-            (void *)caller_rdi, captured ? 1 : 0, from.c_str(), content.c_str());
+        uint64_t candidates[24] = {};
+        const int n = CollectUnwoundNotifyCandidates(hook_context, candidates, 24);
+        int best_score = 0;
+        std::string best_from;
+        std::string best_content;
+        std::string best_avatar;
+        std::string best_conversation;
+        for (int i = 0; i < n; i++)
+        {
+            std::string cand_from;
+            std::string cand_content;
+            std::string cand_avatar;
+            std::string cand_conversation;
+            if (!CaptureFromNotifyObject(candidates[i], cand_from, cand_content,
+                cand_avatar, cand_conversation))
+                continue;
+            const int score = ScoreNotifyCapture(
+                cand_from, cand_content, cand_avatar, cand_conversation);
+            if (score > best_score)
+            {
+                best_score = score;
+                best_from.swap(cand_from);
+                best_content.swap(cand_content);
+                best_avatar.swap(cand_avatar);
+                best_conversation.swap(cand_conversation);
+            }
+        }
+        OutputDebugPrintf("[FlashProbe] unwind candidates=%d best_score=%d from=[%s] content=[%s]",
+            n, best_score, best_from.c_str(), best_content.c_str());
+        if (best_score >= 5 || (best_score >= 3 && !best_from.empty()))
+        {
+            from.swap(best_from);
+            content.swap(best_content);
+            avatar_url.swap(best_avatar);
+            conversation.swap(best_conversation);
+            captured = true;
+            capture_source = "unwind";
+        }
+    }
+
+    if (!captured && ConsumeRecentNotify(now, from, content, avatar_url, conversation))
+    {
+        captured = !content.empty();
+        if (captured)
+            capture_source = "add2db-global";
+        OutputDebugPrintf("[FlashProbe] global candidate captured=%d from=[%s] content=[%s]",
+            captured ? 1 : 0, from.c_str(), content.c_str());
     }
 
     if (!captured && pending_fresh)
@@ -1341,20 +1575,23 @@ extern "C" void ObserveFlashWindowEx(uintptr_t return_address,
                 from,
                 content);
         }
+        if (captured)
+            capture_source = "tls-pending";
         OutputDebugPrintf("[FlashProbe] pending candidate age=%lu captured=%d from=[%s] content=[%s]",
             (unsigned long)(now - state->pending_notify_tick), captured ? 1 : 0,
             from.c_str(), content.c_str());
     }
     else if (pending_fresh)
     {
-        OutputDebugPrintf("[FlashProbe] pending candidate superseded by RDI content");
+        OutputDebugPrintf("[FlashProbe] pending candidate superseded by live capture");
     }
     if (pending_fresh)
         state->pending_notify_valid = 0;
 
     if (captured && !content.empty())
     {
-        OutputDebugPrintf("[FlashProbe] sending notification from=[%s] content=[%s] conversation=[%s] hwnd=%p",
+        OutputDebugPrintf("[FlashProbe] sending notification source=%s from=[%s] content=[%s] conversation=[%s] hwnd=%p",
+            capture_source ? capture_source : "unknown",
             from.c_str(), content.c_str(), conversation.c_str(), hwnd);
         SendWindowsNotification(from, content, avatar_url, conversation, hwnd);
     }
@@ -2116,7 +2353,7 @@ static bool CaptureNotifyMessage(uint64_t message_object, uint64_t content_arg,
             "[FlashProbe] direct fields +0x48=%d +0x2D0=%d +0x1A0 content=[%s]",
             have48 ? 1 : 0, have2d0 ? 1 : 0, content.c_str());
     }
-    else
+    if (content.empty())
     {
         // 当前目标入口的 R9 是辅助 wxid 字符串；若未来版本传入真正
         // 的正文参数，仍先尝试它，再读取消息对象的固定正文槽。
@@ -2145,17 +2382,16 @@ static bool CaptureNotifyMessage(uint64_t message_object, uint64_t content_arg,
             }
         }
 
-        if (content.empty())
+        if (content.empty() && !flash_layout)
         {
             CollectContentFields(message_object, 0x500, msg_type, fields, &msgsource_off);
             content = PickContentField(fields, msgsource_off);
         }
-        if (content.empty())
+        if (content.empty() && !flash_layout)
         {
-            // 某些消息把正文放在一层嵌套对象中；复用已有的安全扫描逻辑。
             content = CaptureOriginalText(message_object);
         }
-        if (content.empty() && auxiliary_object != 0 &&
+        if (content.empty() && !flash_layout && auxiliary_object != 0 &&
             IsMemoryReadable((void *)auxiliary_object, 0x40))
         {
             content = CaptureOriginalText(auxiliary_object);
@@ -2352,13 +2588,16 @@ static void OnTargetHit(PCONTEXT ctx, PEXCEPTION_RECORD /*pExc*/)
 
         std::string from;
         std::string content;
+        std::string avatar;
+        std::string conversation;
         if (g_notify_new_message && CaptureNotifyMessage(
-            ctx->R8, ctx->R9, ctx->Rdx, from, content))
+            ctx->R8, ctx->R9, ctx->Rdx, from, content, false, &avatar, &conversation))
         {
             CopyNotifyField(thread_state->pending_notify_from,
                 sizeof(thread_state->pending_notify_from), from);
             CopyNotifyField(thread_state->pending_notify_content,
                 sizeof(thread_state->pending_notify_content), content);
+            RememberRecentNotify(from, content, avatar, conversation);
             OutputDebugPrintf("[Add2DB] Cached candidate from=[%s] content=[%s]",
                 from.c_str(), content.c_str());
         }
@@ -2641,6 +2880,8 @@ static void OnTargetHit(PCONTEXT ctx, PEXCEPTION_RECORD /*pExc*/)
                     CopyNotifyField(thread_state->pending_notify_content,
                         sizeof(thread_state->pending_notify_content), content);
                     thread_state->pending_notify_valid = 1;
+                    RememberRecentNotify(from_name, content, std::string(),
+                        revoke_tip::looksLikeWxId(from_name) ? from_name : std::string());
                     OutputDebugPrintf("[Add2DB] Candidate saved for Flash notification");
                 }
                 else
