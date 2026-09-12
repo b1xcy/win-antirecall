@@ -1462,6 +1462,16 @@ static bool CaptureFromNotifyObject(uint64_t object, std::string &from, std::str
         !content.empty();
 }
 
+static bool IsCurrentProcessForeground()
+{
+    HWND foreground = GetForegroundWindow();
+    if (foreground == nullptr)
+        return false;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(foreground, &pid);
+    return pid == GetCurrentProcessId();
+}
+
 extern "C" void ObserveFlashWindowEx(uintptr_t return_address,
     const FLASHWINFO *flash_info, const CONTEXT *hook_context)
 {
@@ -1590,10 +1600,18 @@ extern "C" void ObserveFlashWindowEx(uintptr_t return_address,
 
     if (captured && !content.empty())
     {
-        OutputDebugPrintf("[FlashProbe] sending notification source=%s from=[%s] content=[%s] conversation=[%s] hwnd=%p",
-            capture_source ? capture_source : "unknown",
-            from.c_str(), content.c_str(), conversation.c_str(), hwnd);
-        SendWindowsNotification(from, content, avatar_url, conversation, hwnd);
+        if (IsCurrentProcessForeground())
+        {
+            OutputDebugPrintf("[FlashProbe] skip notification, already foreground source=%s from=[%s] hwnd=%p",
+                capture_source ? capture_source : "unknown", from.c_str(), hwnd);
+        }
+        else
+        {
+            OutputDebugPrintf("[FlashProbe] sending notification source=%s from=[%s] content=[%s] conversation=[%s] hwnd=%p",
+                capture_source ? capture_source : "unknown",
+                from.c_str(), content.c_str(), conversation.c_str(), hwnd);
+            SendWindowsNotification(from, content, avatar_url, conversation, hwnd);
+        }
     }
 
     if (state->flash_caller.valid)
