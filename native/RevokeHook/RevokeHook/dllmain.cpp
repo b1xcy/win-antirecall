@@ -465,7 +465,8 @@ static void KillWeixinUpdateOnce()
     {
         do
         {
-            if (_wcsicmp(pe.szExeFile, L"WeixinUpdate.exe") == 0)
+            if (_wcsicmp(pe.szExeFile, L"WeixinUpdate.exe") == 0
+                || _wcsicmp(pe.szExeFile, L"WeChatUpdate.exe") == 0)
             {
                 HANDLE proc = OpenProcess(PROCESS_TERMINATE, FALSE, pe.th32ProcessID);
                 if (proc != nullptr)

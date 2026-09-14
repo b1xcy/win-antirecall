@@ -7,7 +7,9 @@ tip_phrase: "已拦截 {from} 于 {time} 撤回：{content}"
 # Also intercept your own recalls
 anti_revoke_self: true
 
-# Kill WeixinUpdate.exe while WeChat is running, and try to disable the updater binary
+# Kill updater processes, deny Users execute on updater binaries,
+# lock %APPDATA%\Tencent\xwechat update dirs, disable scheduled update tasks,
+# and replace WeixinUpdate.exe with a stub when possible
 block_update: true
 
 # Bottom-right popup after inject finishes
