@@ -8,8 +8,8 @@ tip_phrase: "已拦截 {from} 于 {time} 撤回：{content}"
 anti_revoke_self: true
 
 # Kill updater processes, deny Users execute on updater binaries,
-# lock %APPDATA%\Tencent\xwechat update dirs, disable scheduled update tasks,
-# and replace WeixinUpdate.exe with a stub when possible
+# lock %APPDATA%\Tencent\xwechat update/UpdateNotify dirs, disable scheduled update tasks,
+# replace WeixinUpdate.exe with a stub when possible, and block in-app new-version prompts
 block_update: true
 
 # Bottom-right popup after inject finishes

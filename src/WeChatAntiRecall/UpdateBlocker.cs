@@ -18,6 +18,7 @@ internal static class UpdateBlocker
     private static readonly string[] XWeChatProtectRel =
     [
         @"XPlugin\Plugins\WeixinUpdate",
+        @"XPlugin\Plugins\UpdateNotify",
         "update",
     ];
 
@@ -61,6 +62,22 @@ internal static class UpdateBlocker
 
         foreach (var dir in protectedDirs)
         {
+            if (dir.IndexOf("UpdateNotify", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                try
+                {
+                    foreach (var file in Directory.EnumerateFiles(dir, "*", SearchOption.AllDirectories))
+                    {
+                        try { File.Delete(file); } catch { }
+                    }
+                    log?.Invoke($"已清空 {dir}");
+                }
+                catch (Exception ex)
+                {
+                    log?.Invoke($"清空 {dir} 失败: {ex.Message}");
+                }
+            }
+
             SetDirAclDeny(dir, log);
         }
 

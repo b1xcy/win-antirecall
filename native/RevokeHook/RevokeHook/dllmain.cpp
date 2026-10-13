@@ -10,24 +10,35 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
+#include <cstring>
 #include <wchar.h>
 #include <fstream>
 #include "vehbp.h"
 #include "revoke_tip.h"
-#include <TlHelp32.h> 
+#include <TlHelp32.h>
+#include <objbase.h>
+#include <oleacc.h>
+#include <oleauto.h>
+#include <UIAutomation.h>
 
 //用于计算MD5
 #pragma comment(lib, "crypt32.lib")
 #pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "oleaut32.lib")
+#pragma comment(lib, "oleacc.lib")
+#pragma comment(lib, "UIAutomationCore.lib")
 
 //打印日志
 static HANDLE g_hLogFile = INVALID_HANDLE_VALUE;
 
 // Balloon notification bridge
+extern "C" void CancelWindowsNotifications();
 extern "C" void SendWindowsNotificationForChat(const char* from_utf8,
     const char* content_utf8, const char* avatar_url_utf8,
     const char* conversation_utf8, HWND chat_window);
 bool InitNotifyIatHook();
+bool InitUpdateIatHook();
 extern "C" void ObserveFlashWindowEx(uintptr_t return_address,
     const FLASHWINFO *flash_info, const CONTEXT *hook_context);
 static void SendWindowsNotification(const std::string &from, const std::string &content,
@@ -37,6 +48,9 @@ static void SendWindowsNotification(const std::string &from, const std::string &
 static void* g_bpDelMsg = nullptr;
 static void* g_bpAdd2DB = nullptr;
 static void* g_bpAdd2DBTarget = nullptr;
+static void* g_bpRevokeResult = nullptr;
+static void* g_bpRevokeResultReady = nullptr;
+static void (*g_notifyAddedMessage)(void *, void *) = nullptr;
 
 static DWORD g_tlsThreadState = TLS_OUT_OF_INDEXES;
 struct FlashCallerState
@@ -62,6 +76,11 @@ struct ThreadState
 {
     uint8_t last_org_srvid[8];      //真实的srvid 防止插入两条撤回提醒
     uint8_t anti_revoke_cur_msg;    //是否防撤回当前这条消息
+    uint64_t revoke_manager;
+    uint64_t revoke_result;
+    uint64_t revoke_result_rsp;
+    uint64_t revoke_tip_srvid;
+    uint8_t revoke_notify_pending;
     char pending_content[512];      // DelMsg.RDX+0x1A0 原文 / [图片] 等, 同线程带给 Add2DB
     FlashCallerState flash_caller;
     uint64_t pending_notify_msg;
@@ -187,6 +206,9 @@ bool g_notify_new_message = false; //是否通知新消息
 bool g_notify_dump_all = false;
 std::string g_notify_probe_text = "__WA_NOTIFY_PROBE_7F3A__";
 static volatile LONG g_stopUpdateBlocker = 0;
+static HMODULE g_selfModule = nullptr;
+static HWINEVENTHOOK g_updateShowEventHook = nullptr;
+static IUIAutomation *g_uia = nullptr;
 
 static wchar_t g_selfDir[MAX_PATH] = {};
 
@@ -480,12 +502,450 @@ static void KillWeixinUpdateOnce()
     CloseHandle(snap);
 }
 
+static int PatchAsciiCString(HMODULE module, const char *needle)
+{
+    if (module == nullptr || needle == nullptr || needle[0] == '\0')
+        return 0;
+
+    auto *base = reinterpret_cast<uint8_t *>(module);
+    auto *dos = reinterpret_cast<IMAGE_DOS_HEADER *>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE)
+        return 0;
+    auto *nt = reinterpret_cast<IMAGE_NT_HEADERS64 *>(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE)
+        return 0;
+
+    const size_t nlen = strlen(needle);
+    int patched = 0;
+    auto *sec = IMAGE_FIRST_SECTION(nt);
+    for (UINT i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++sec)
+    {
+        if ((sec->Characteristics & IMAGE_SCN_MEM_EXECUTE) != 0)
+            continue;
+        if (sec->VirtualAddress == 0 || sec->Misc.VirtualSize <= nlen)
+            continue;
+
+        uint8_t *p = base + sec->VirtualAddress;
+        const size_t sz = sec->Misc.VirtualSize;
+        for (size_t off = 0; off + nlen < sz; ++off)
+        {
+            if (memcmp(p + off, needle, nlen) != 0 || p[off + nlen] != 0)
+                continue;
+            DWORD oldProtect = 0;
+            if (!VirtualProtect(p + off, 1, PAGE_READWRITE, &oldProtect))
+                continue;
+            p[off] = '.';
+            VirtualProtect(p + off, 1, oldProtect, &oldProtect);
+            ++patched;
+        }
+    }
+    return patched;
+}
+
+static void PatchWeixinUpdateStrings()
+{
+    HMODULE modules[] = {
+        GetModuleHandleW(nullptr),
+        GetModuleHandleW(L"Weixin.dll"),
+    };
+    static const char *kNeedles[] = {
+        "WeixinUpdate.exe",
+        "WeixinUpdate",
+        "UpdateNotify",
+        "mmkv_key_revert_update_version",
+    };
+    for (HMODULE module : modules)
+    {
+        if (module == nullptr)
+            continue;
+        for (const char *needle : kNeedles)
+        {
+            const int n = PatchAsciiCString(module, needle);
+            if (n > 0)
+                OutputDebugPrintf("[RevokeHook] Patched %s x%d in %p", needle, n, module);
+        }
+    }
+}
+
+static bool TextContainsNeedle(const wchar_t *text, const wchar_t *needle)
+{
+    if (text == nullptr || needle == nullptr || needle[0] == L'\0')
+        return false;
+    const size_t n = wcslen(needle);
+    for (const wchar_t *p = text; *p; ++p)
+    {
+        if (_wcsnicmp(p, needle, n) == 0)
+            return true;
+    }
+    return false;
+}
+
+static bool TitleLooksLikeUpdatePrompt(const wchar_t *title)
+{
+    if (title == nullptr || title[0] == L'\0')
+        return false;
+    static const wchar_t *kNeedles[] = {
+        L"新版本",
+        L"立即更新",
+        L"版本过低",
+        L"发现新",
+        L"微信更新",
+        L"WeixinUpdate",
+        L"WeChatUpdate",
+        L"New Version",
+        L"Update Available",
+        L"不再提醒该更新",
+        L"忽略本次更新",
+        L"稍后处理",
+    };
+    for (const wchar_t *needle : kNeedles)
+    {
+        if (TextContainsNeedle(title, needle))
+            return true;
+    }
+    return false;
+}
+
+static IUIAutomation *GetUia()
+{
+    IUIAutomation *cached = (IUIAutomation *)InterlockedCompareExchangePointer(
+        (PVOID *)&g_uia, nullptr, nullptr);
+    if (cached != nullptr)
+        return cached;
+
+    HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    (void)hr;
+
+    IUIAutomation *created = nullptr;
+    hr = CoCreateInstance(CLSID_CUIAutomation, nullptr, CLSCTX_INPROC_SERVER,
+        IID_IUIAutomation, (void **)&created);
+    if (FAILED(hr) || created == nullptr)
+        return nullptr;
+
+    PVOID previous = InterlockedCompareExchangePointer((PVOID *)&g_uia, created, nullptr);
+    if (previous != nullptr)
+    {
+        created->Release();
+        return (IUIAutomation *)previous;
+    }
+    return created;
+}
+
+static bool UiaClassIsUpdateWindow(HWND hwnd)
+{
+    IUIAutomation *uia = GetUia();
+    if (uia == nullptr || hwnd == nullptr)
+        return false;
+
+    IUIAutomationElement *el = nullptr;
+    if (FAILED(uia->ElementFromHandle(hwnd, &el)) || el == nullptr)
+        return false;
+
+    BSTR name = nullptr;
+    HRESULT hr = el->get_CurrentClassName(&name);
+    bool match = SUCCEEDED(hr) && name != nullptr
+        && wcscmp(name, L"mmui::UpdateWindow") == 0;
+    if (name != nullptr)
+        SysFreeString(name);
+    el->Release();
+    return match;
+}
+
+static bool AccNodeLooksLikeUpdate(IAccessible *acc, int depth)
+{
+    if (acc == nullptr || depth > 5)
+        return false;
+
+    VARIANT self;
+    VariantInit(&self);
+    self.vt = VT_I4;
+    self.lVal = CHILDID_SELF;
+    BSTR name = nullptr;
+    if (SUCCEEDED(acc->get_accName(self, &name)) && name != nullptr)
+    {
+        const bool hit = TitleLooksLikeUpdatePrompt(name);
+        SysFreeString(name);
+        if (hit)
+            return true;
+    }
+
+    long count = 0;
+    if (FAILED(acc->get_accChildCount(&count)) || count <= 0)
+        return false;
+    if (count > 24)
+        count = 24;
+
+    for (long i = 1; i <= count; ++i)
+    {
+        VARIANT child;
+        VariantInit(&child);
+        child.vt = VT_I4;
+        child.lVal = i;
+        IDispatch *disp = nullptr;
+        if (FAILED(acc->get_accChild(child, &disp)) || disp == nullptr)
+            continue;
+        IAccessible *next = nullptr;
+        if (SUCCEEDED(disp->QueryInterface(IID_IAccessible, (void **)&next)) && next != nullptr)
+        {
+            const bool hit = AccNodeLooksLikeUpdate(next, depth + 1);
+            next->Release();
+            disp->Release();
+            if (hit)
+                return true;
+        }
+        else
+        {
+            disp->Release();
+        }
+    }
+    return false;
+}
+
+static bool AccLooksLikeUpdateWindow(HWND hwnd)
+{
+    IAccessible *acc = nullptr;
+    if (FAILED(AccessibleObjectFromWindow(hwnd, OBJID_CLIENT, IID_IAccessible, (void **)&acc))
+        || acc == nullptr)
+        return false;
+    const bool hit = AccNodeLooksLikeUpdate(acc, 0);
+    acc->Release();
+    return hit;
+}
+
+static bool HwndLooksLikeQtWindow(HWND hwnd)
+{
+    wchar_t cls[64] = {};
+    if (GetClassNameW(hwnd, cls, 64) <= 0)
+        return false;
+    return wcsncmp(cls, L"Qt", 2) == 0;
+}
+
+extern "C" bool ShouldBlockUpdateWindowShow(HWND hwnd)
+{
+    static thread_local bool inCheck = false;
+    if (!g_block_update || hwnd == nullptr || !IsWindow(hwnd) || inCheck)
+        return false;
+    if (!HwndLooksLikeQtWindow(hwnd))
+        return false;
+    inCheck = true;
+
+    RECT rc{};
+    if (GetWindowRect(hwnd, &rc))
+    {
+        const int w = rc.right - rc.left;
+        const int h = rc.bottom - rc.top;
+        if (w < 240 || h < 180)
+            return false;
+    }
+
+    bool hit = UiaClassIsUpdateWindow(hwnd) || AccLooksLikeUpdateWindow(hwnd);
+    if (!hit)
+    {
+        wchar_t title[256] = {};
+        GetWindowTextW(hwnd, title, 256);
+        hit = TitleLooksLikeUpdatePrompt(title);
+    }
+    inCheck = false;
+    return hit;
+}
+
+static bool InvokeNamedButton(IUIAutomationElement *root, const wchar_t *name)
+{
+    IUIAutomation *uia = GetUia();
+    if (uia == nullptr || root == nullptr || name == nullptr)
+        return false;
+
+    VARIANT v;
+    VariantInit(&v);
+    v.vt = VT_BSTR;
+    v.bstrVal = SysAllocString(name);
+    if (v.bstrVal == nullptr)
+        return false;
+
+    IUIAutomationCondition *cond = nullptr;
+    HRESULT hr = uia->CreatePropertyCondition(UIA_NamePropertyId, v, &cond);
+    VariantClear(&v);
+    if (FAILED(hr) || cond == nullptr)
+        return false;
+
+    IUIAutomationElement *btn = nullptr;
+    hr = root->FindFirst(TreeScope_Descendants, cond, &btn);
+    cond->Release();
+    if (FAILED(hr) || btn == nullptr)
+        return false;
+
+    IUIAutomationInvokePattern *invoke = nullptr;
+    hr = btn->GetCurrentPatternAs(UIA_InvokePatternId, IID_IUIAutomationInvokePattern,
+        (void **)&invoke);
+    bool ok = false;
+    if (SUCCEEDED(hr) && invoke != nullptr)
+    {
+        ok = SUCCEEDED(invoke->Invoke());
+        invoke->Release();
+    }
+    btn->Release();
+    return ok;
+}
+
+static void DismissUpdateWindow(HWND hwnd, IUIAutomationElement *el)
+{
+    if (el != nullptr)
+    {
+        if (InvokeNamedButton(el, L"忽略本次更新"))
+            OutputDebugPrintf("[RevokeHook] Invoked dismiss on hwnd=%p", hwnd);
+        else if (InvokeNamedButton(el, L"稍后处理"))
+            OutputDebugPrintf("[RevokeHook] Invoked later on hwnd=%p", hwnd);
+        else if (InvokeNamedButton(el, L"不再提醒该更新"))
+            OutputDebugPrintf("[RevokeHook] Invoked legacy dismiss on hwnd=%p", hwnd);
+        else if (InvokeNamedButton(el, L"以后再说"))
+            OutputDebugPrintf("[RevokeHook] Invoked legacy later on hwnd=%p", hwnd);
+    }
+
+    if (hwnd != nullptr && IsWindow(hwnd))
+    {
+        ShowWindow(hwnd, SW_HIDE);
+        PostMessageW(hwnd, WM_CLOSE, 0, 0);
+        OutputDebugPrintf("[RevokeHook] Closed update prompt hwnd=%p", hwnd);
+    }
+}
+
+static void CloseUpdateWindowsViaUia()
+{
+    IUIAutomation *uia = GetUia();
+    if (uia == nullptr)
+        return;
+
+    IUIAutomationElement *root = nullptr;
+    if (FAILED(uia->GetRootElement(&root)) || root == nullptr)
+        return;
+
+    VARIANT v;
+    VariantInit(&v);
+    v.vt = VT_BSTR;
+    v.bstrVal = SysAllocString(L"mmui::UpdateWindow");
+    IUIAutomationCondition *cond = nullptr;
+    HRESULT hr = E_FAIL;
+    if (v.bstrVal != nullptr)
+        hr = uia->CreatePropertyCondition(UIA_ClassNamePropertyId, v, &cond);
+    VariantClear(&v);
+    if (FAILED(hr) || cond == nullptr)
+    {
+        root->Release();
+        return;
+    }
+
+    IUIAutomationElementArray *found = nullptr;
+    hr = root->FindAll(TreeScope_Children, cond, &found);
+    cond->Release();
+    root->Release();
+    if (FAILED(hr) || found == nullptr)
+        return;
+
+    int count = 0;
+    found->get_Length(&count);
+    const DWORD selfPid = GetCurrentProcessId();
+    for (int i = 0; i < count; ++i)
+    {
+        IUIAutomationElement *el = nullptr;
+        if (FAILED(found->GetElement(i, &el)) || el == nullptr)
+            continue;
+
+        int pid = 0;
+        el->get_CurrentProcessId(&pid);
+        if (pid != (int)selfPid)
+        {
+            el->Release();
+            continue;
+        }
+
+        UIA_HWND uiaHwnd = nullptr;
+        el->get_CurrentNativeWindowHandle(&uiaHwnd);
+        DismissUpdateWindow((HWND)uiaHwnd, el);
+        el->Release();
+    }
+    found->Release();
+}
+
+static BOOL CALLBACK CloseUpdatePromptProc(HWND hwnd, LPARAM)
+{
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (pid != GetCurrentProcessId())
+        return TRUE;
+    if (!IsWindowVisible(hwnd) && !HwndLooksLikeQtWindow(hwnd))
+        return TRUE;
+    if (!ShouldBlockUpdateWindowShow(hwnd))
+        return TRUE;
+    DismissUpdateWindow(hwnd, nullptr);
+    return TRUE;
+}
+
+static void CloseUpdatePromptWindows()
+{
+    CloseUpdateWindowsViaUia();
+    EnumWindows(CloseUpdatePromptProc, 0);
+}
+
+static void CALLBACK OnUpdateShowEvent(
+    HWINEVENTHOOK, DWORD event, HWND hwnd, LONG idObject, LONG idChild,
+    DWORD, DWORD)
+{
+    if (event != EVENT_OBJECT_SHOW || hwnd == nullptr)
+        return;
+    if (idObject != OBJID_WINDOW || idChild != CHILDID_SELF)
+        return;
+    if (ShouldBlockUpdateWindowShow(hwnd))
+        DismissUpdateWindow(hwnd, nullptr);
+}
+
+static void LogWeixinProcessRoles()
+{
+    OutputDebugPrintf("[RevokeHook] Injected pid=%u cmd=%ls",
+        GetCurrentProcessId(), GetCommandLineW());
+
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE)
+        return;
+    PROCESSENTRY32W pe{};
+    pe.dwSize = sizeof(pe);
+    if (Process32FirstW(snap, &pe))
+    {
+        do
+        {
+            if (_wcsicmp(pe.szExeFile, L"Weixin.exe") != 0)
+                continue;
+            OutputDebugPrintf("[RevokeHook] Weixin.exe pid=%u parent=%u%s",
+                pe.th32ProcessID, pe.th32ParentProcessID,
+                pe.th32ProcessID == GetCurrentProcessId() ? " (main/injected)" : "");
+        } while (Process32NextW(snap, &pe));
+    }
+    CloseHandle(snap);
+}
+
 static DWORD WINAPI UpdateBlockerThread(LPVOID)
 {
+    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    LogWeixinProcessRoles();
+
+    if (g_selfModule != nullptr)
+    {
+        g_updateShowEventHook = SetWinEventHook(
+            EVENT_OBJECT_SHOW, EVENT_OBJECT_SHOW, g_selfModule,
+            OnUpdateShowEvent, GetCurrentProcessId(), 0, WINEVENT_INCONTEXT);
+        OutputDebugPrintf("[RevokeHook] Update Show event hook=%p", g_updateShowEventHook);
+    }
+
+    int round = 0;
     while (InterlockedCompareExchange(&g_stopUpdateBlocker, 0, 0) == 0)
     {
+        if (round == 0)
+            PatchWeixinUpdateStrings();
+        if (round < 3)
+            InitUpdateIatHook();
         KillWeixinUpdateOnce();
-        Sleep(2000);
+        CloseUpdatePromptWindows();
+        ++round;
+        Sleep(round < 5 ? 400 : 2000);
     }
     return 0;
 }
@@ -1491,6 +1951,9 @@ extern "C" void ObserveFlashWindowEx(uintptr_t return_address,
         (void *)return_address, hwnd, flags, count,
         state->flash_caller.valid ? 1 : 0);
 
+    if (flags == FLASHW_STOP || IsCurrentProcessForeground())
+        CancelWindowsNotifications();
+
     if ((flags & FLASHW_TRAY) == 0)
         return;
 
@@ -1635,10 +2098,7 @@ extern "C" void ObserveFlashWindowEx(uintptr_t return_address,
     }
 }
 
-// Add2DBOffset 落在 wrapper 里的 call CoAddMessageToDB 上。wrapper 的唯一调用方
-// 在该 call 返回后会再 call 一次 UI notify。把 notify 的 rdx 换成 tip 对象，
-// 当前会话才会立刻插入提示气泡。
-static void *DiscoverNotifyCall(uint8_t *img, uint64_t add2db_offset)
+static void *DiscoverAddResultCall(uint8_t *img, uint64_t add2db_offset)
 {
     uint8_t *inner_call = img + add2db_offset;
     if (!IsMemoryReadable(inner_call, 16) || inner_call[0] != 0xE8)
@@ -1703,6 +2163,45 @@ static void *DiscoverNotifyCall(uint8_t *img, uint64_t add2db_offset)
     return nullptr;
 }
 
+
+static void DiscoverRevokeRefresh(uint8_t *img, uint64_t add2db_offset)
+{
+    auto *result_call = static_cast<uint8_t *>(DiscoverAddResultCall(img, add2db_offset));
+    const uint8_t result_args[] = { 0x48, 0x8D, 0x4D, 0xF7, 0x48, 0x89, 0xF2, 0x4D, 0x89, 0xF0 };
+    if (result_call == nullptr || !IsMemoryReadable(result_call - 10, 16) ||
+        memcmp(result_call - 10, result_args, sizeof(result_args)) != 0 || result_call[5] != 0x90)
+        return;
+
+    const uint8_t notify_args[] = {
+        0x8B, 0xB8, 0x44, 0x01, 0x00, 0x00, 0x85, 0xFF, 0x74, 0x45,
+        0x48, 0x89, 0xF1, 0x48, 0x89, 0xC2, 0xE8
+    };
+    const uint8_t notify_entry[] = {
+        0x55, 0x41, 0x56, 0x56, 0x57, 0x53, 0x48, 0x81, 0xEC, 0x60, 0x03, 0x00, 0x00
+    };
+    size_t text_size = 0;
+    uint8_t *text = PeSection((HMODULE)img, ".text", &text_size);
+    uint8_t *notify = nullptr;
+    for (size_t i = 0; text != nullptr && i + sizeof(notify_args) + 4 <= text_size; ++i)
+    {
+        if (memcmp(text + i, notify_args, sizeof(notify_args)) != 0)
+            continue;
+        int32_t rel = 0;
+        memcpy(&rel, text + i + sizeof(notify_args), sizeof(rel));
+        uint8_t *target = text + i + sizeof(notify_args) + sizeof(rel) + rel;
+        if (target < text || target + sizeof(notify_entry) > text + text_size ||
+            memcmp(target, notify_entry, sizeof(notify_entry)) != 0)
+            continue;
+        if (notify != nullptr && notify != target)
+            return;
+        notify = target;
+    }
+    if (notify == nullptr)
+        return;
+    g_notifyAddedMessage = reinterpret_cast<void (*)(void *, void *)>(notify);
+    g_bpRevokeResult = result_call;
+    g_bpRevokeResultReady = result_call + 5;
+}
 
 static uint8_t *FindWrapper(uint8_t *inner_call)
 {
@@ -2547,6 +3046,36 @@ static void OnTargetHit(PCONTEXT ctx, PEXCEPTION_RECORD /*pExc*/)
         return;
     }
 
+    if (g_bpRevokeResult != nullptr && rip == (uint64_t)g_bpRevokeResult)
+    {
+        if (thread_state->revoke_notify_pending)
+        {
+            thread_state->revoke_result = ctx->Rdx;
+            thread_state->revoke_result_rsp = ctx->Rsp;
+        }
+        return;
+    }
+    if (g_bpRevokeResultReady != nullptr && rip == (uint64_t)g_bpRevokeResultReady)
+    {
+        if (!thread_state->revoke_notify_pending || thread_state->revoke_result_rsp != ctx->Rsp)
+            return;
+        thread_state->revoke_notify_pending = 0;
+        uint64_t result = thread_state->revoke_result;
+        uint64_t manager = thread_state->revoke_manager;
+        if (ctx->Rax != result || !IsMemoryReadable((void *)result, 0x2D8) ||
+            !IsMemoryReadable((void *)manager, 0xF8) ||
+            ReadUint64At(result, g_config_info.add2db_info.offset_srvid) != thread_state->revoke_tip_srvid ||
+            *(uint32_t *)(result + 0x144) == 0)
+        {
+            OutputDebugPrintf("[RevokeRefresh] Skip invalid or unsuccessful add result");
+            return;
+        }
+        g_notifyAddedMessage((void *)manager, (void *)result);
+        OutputDebugPrintf("[RevokeRefresh] Dispatched added tip local_id=%u",
+            *(uint32_t *)(result + 0x144));
+        return;
+    }
+
     if (IsFlashCallerBreakpoint(rip))
     {
         FlashCallerState &flash = thread_state->flash_caller;
@@ -2715,6 +3244,8 @@ static void OnTargetHit(PCONTEXT ctx, PEXCEPTION_RECORD /*pExc*/)
             OutputDebugPrintf("[Debug] Anti Revoke SELF Msg...");
 
         thread_state->anti_revoke_cur_msg = 1;
+        thread_state->revoke_manager = ctx->Rcx;
+        thread_state->revoke_notify_pending = 0;
         thread_state->pending_content[0] = '\0';
         {
             uint64_t original_obj = GetArgValue(ctx, g_config_info.delmsg_info.arg_msg_index);
@@ -2762,6 +3293,7 @@ static void OnTargetHit(PCONTEXT ctx, PEXCEPTION_RECORD /*pExc*/)
     else if (rip == (uint64_t)g_bpAdd2DB)
     {
         const bool was_anti_revoke = thread_state->anti_revoke_cur_msg != 0;
+        thread_state->revoke_notify_pending = 0;
         thread_state->suppress_next_notify = was_anti_revoke ? 1 : 0;
         thread_state->anti_revoke_cur_msg = 0;
 
@@ -3060,6 +3592,13 @@ static void OnTargetHit(PCONTEXT ctx, PEXCEPTION_RECORD /*pExc*/)
 
         ForceAllowNewId(ctx, arg_bool_index);
         OutputDebugPrintf("[Debug] Forced allow-new-id bool_idx=%d", arg_bool_index);
+        if (g_notifyAddedMessage != nullptr)
+        {
+            thread_state->revoke_tip_srvid = ReadUint64At(arg_msg, g_config_info.add2db_info.offset_srvid);
+            thread_state->revoke_result = 0;
+            thread_state->revoke_result_rsp = 0;
+            thread_state->revoke_notify_pending = 1;
+        }
     }
 }
 
@@ -3103,6 +3642,7 @@ BOOL APIENTRY DllMain( HMODULE hModule,
     switch (ul_reason_for_call)
     {
     case DLL_PROCESS_ATTACH:
+        g_selfModule = hModule;
         if (!InitThreadStateTls()) {
             OutputDebugString(TEXT("[RevokeHook] InitThreadStateTls Failed!"));
             break;
@@ -3140,6 +3680,25 @@ BOOL APIENTRY DllMain( HMODULE hModule,
             OutputDebugPrintf("[RevokeHook] AddBp %p OK", g_bpDelMsg);
 
         DiscoverAdd2DBTargetBreakpoint();
+
+        DiscoverRevokeRefresh((uint8_t *)g_config_info.basic_info.imgbase,
+            g_config_info.basic_info.add2db_offset);
+        if (g_notifyAddedMessage != nullptr)
+        {
+            int result_bp = VehBp_Set(g_bpRevokeResult, OnTargetHit);
+            int ready_bp = VehBp_Set(g_bpRevokeResultReady, OnTargetHit);
+            if (result_bp < 0 || ready_bp < 0)
+            {
+                if (result_bp >= 0) VehBp_Remove(result_bp);
+                if (ready_bp >= 0) VehBp_Remove(ready_bp);
+                g_notifyAddedMessage = nullptr;
+                g_bpRevokeResult = nullptr;
+                g_bpRevokeResultReady = nullptr;
+            }
+        }
+        OutputDebugPrintf("[RevokeRefresh] %s result=%p notify=%p",
+            g_notifyAddedMessage != nullptr ? "Enabled" : "Unavailable for this layout",
+            g_bpRevokeResultReady, g_notifyAddedMessage);
 
         if (VehBp_Set(g_bpAdd2DB, OnTargetHit) == -1)
             OutputDebugPrintf("[RevokeHook] AddBp %p Error", g_bpAdd2DB);

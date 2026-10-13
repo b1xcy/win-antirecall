@@ -1,4 +1,5 @@
 #include "framework.h"
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -8,13 +9,20 @@
 #include <gdiplus.h>
 #include <intrin.h>
 #include <shellapi.h>
+#include <shobjidl.h>
+#include <propkey.h>
+#include <propvarutil.h>
 #include <string>
 #include <vector>
 #include <winhttp.h>
+#include <TlHelp32.h>
 
 #pragma comment(lib, "gdiplus.lib")
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "winhttp.lib")
+#pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "propsys.lib")
+#pragma comment(lib, "advapi32.lib")
 
 // 外部日志函数
 extern void OutputDebugPrintf(const char* fmt, ...);
@@ -34,6 +42,8 @@ struct NotificationParams
     HWND chatWindow;
     DWORD chatThread;
     UINT id;
+    DWORD queuedAt;
+    UINT generation;
 };
 
 // 只保留一个待显示的通知，避免锁屏期间向 Shell 累积气泡。
@@ -45,6 +55,25 @@ static volatile LONG g_notificationWorkerRunning = 0;
 static UINT g_openChatMessage = 0;
 static HHOOK g_openChatHook = nullptr;
 static NotificationParams g_requestedChat = {};
+static UINT g_notificationGeneration = 0;
+
+static bool IsWeChatForeground()
+{
+    DWORD process = 0;
+    GetWindowThreadProcessId(GetForegroundWindow(), &process);
+    return process == GetCurrentProcessId();
+}
+
+extern "C" void CancelWindowsNotifications()
+{
+    AcquireSRWLockExclusive(&g_notificationLock);
+    g_pendingNotificationValid = false;
+    ++g_notificationGeneration;
+    HANDLE event = g_notificationEvent;
+    ReleaseSRWLockExclusive(&g_notificationLock);
+    if (event)
+        SetEvent(event);
+}
 
 static void OpenNativeChat(const char *username)
 {
@@ -395,6 +424,7 @@ static LRESULT CALLBACK NotificationWindowProc(HWND hWnd, UINT message,
         const UINT id = HIWORD(lParam) ? HIWORD(lParam) : static_cast<UINT>(wParam);
         if (notification && notification->id == id)
         {
+            CancelWindowsNotifications();
             if (notification->conversation[0])
                 RequestOpenChat(*notification);
             else
@@ -417,14 +447,30 @@ static DWORD WINAPI NotificationThread(LPVOID param)
     NOTIFYICONDATAW nid = {};
     bool iconAdded = false;
     NotificationParams displayedNotification = {};
+    const HRESULT comResult = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     __try
     {
         (void)param;
 
         DWORD balloonEnd = 0;
+        UINT generation = 0;
+        bool wasForeground = false;
 
         for (;;)
         {
+            const bool foreground = IsWeChatForeground();
+            if (foreground && !wasForeground)
+                CancelWindowsNotifications();
+            wasForeground = foreground;
+            AcquireSRWLockShared(&g_notificationLock);
+            const UINT currentGeneration = g_notificationGeneration;
+            ReleaseSRWLockShared(&g_notificationLock);
+            if (iconAdded && (foreground || generation != currentGeneration))
+            {
+                Shell_NotifyIconW(NIM_DELETE, &nid);
+                iconAdded = false;
+                displayedNotification = {};
+            }
             // 锁屏时不调用 NIM_MODIFY；保留待显示的最新一条，解锁后只显示这一条。
             if (IsWorkstationLocked())
             {
@@ -434,16 +480,14 @@ static DWORD WINAPI NotificationThread(LPVOID param)
                     iconAdded = false;
                 }
             }
-            else
+            else if (!foreground)
             {
                 NotificationParams np = {};
                 if (TakePendingNotification(np))
                 {
-                    if (iconAdded)
-                    {
-                        Shell_NotifyIconW(NIM_DELETE, &nid);
-                        iconAdded = false;
-                    }
+                    if (GetTickCount() - np.queuedAt > 6000 ||
+                        np.generation != currentGeneration)
+                        continue;
 
                     if (!hWnd)
                     {
@@ -451,7 +495,8 @@ static DWORD WINAPI NotificationThread(LPVOID param)
                             np.from, np.content);
 
                         // 创建隐藏窗口
-                        hWnd = CreateWindowExW(0, L"STATIC", L"NotifyWindow", 0, 0, 0, 0, 0,
+                        hWnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                            L"STATIC", L"NotifyWindow", 0, 0, 0, 0, 0,
                             nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
 
                         if (!hWnd)
@@ -460,6 +505,32 @@ static DWORD WINAPI NotificationThread(LPVOID param)
                         }
                         else
                         {
+                            const wchar_t appId[] = L"WeChatAntiRecall.MessageNotifications";
+                            const wchar_t displayName[] = L"微信";
+                            HKEY appKey = nullptr;
+                            LONG registryResult = RegCreateKeyExW(HKEY_CURRENT_USER,
+                                L"Software\\Classes\\AppUserModelId\\WeChatAntiRecall.MessageNotifications",
+                                0, nullptr, 0, KEY_SET_VALUE, nullptr, &appKey, nullptr);
+                            if (registryResult == ERROR_SUCCESS)
+                            {
+                                registryResult = RegSetValueExW(appKey, L"DisplayName", 0,
+                                    REG_SZ, reinterpret_cast<const BYTE *>(displayName), sizeof(displayName));
+                                RegCloseKey(appKey);
+                            }
+                            IPropertyStore *properties = nullptr;
+                            HRESULT identityResult = SHGetPropertyStoreForWindow(hWnd,
+                                IID_PPV_ARGS(&properties));
+                            if (SUCCEEDED(identityResult))
+                            {
+                                PROPVARIANT value = {};
+                                identityResult = InitPropVariantFromString(appId, &value);
+                                if (SUCCEEDED(identityResult))
+                                    identityResult = properties->SetValue(PKEY_AppUserModel_ID, value);
+                                PropVariantClear(&value);
+                                properties->Release();
+                            }
+                            OutputDebugPrintf("[Toast] Application identity: registry=%ld window=0x%X",
+                                registryResult, static_cast<unsigned>(identityResult));
                             SetWindowLongPtrW(hWnd, GWLP_USERDATA,
                                 reinterpret_cast<LONG_PTR>(&displayedNotification));
                             SetWindowLongPtrW(hWnd, GWLP_WNDPROC,
@@ -524,37 +595,44 @@ static DWORD WINAPI NotificationThread(LPVOID param)
 
                         // Downloading may span a lock event or a newer queued message.
                         const bool locked = IsWorkstationLocked();
+                        const bool nowForeground = IsWeChatForeground();
                         AcquireSRWLockExclusive(&g_notificationLock);
                         const bool superseded = g_pendingNotificationValid;
-                        if (locked && !superseded)
+                        const bool cancelled = np.generation != g_notificationGeneration;
+                        if (locked && !superseded && !cancelled && !nowForeground)
                         {
                             g_pendingNotification = np;
                             g_pendingNotificationValid = true;
                         }
                         ReleaseSRWLockExclusive(&g_notificationLock);
-                        if (locked || superseded)
+                        if (locked || superseded || cancelled || nowForeground ||
+                            GetTickCount() - np.queuedAt > 6000)
                             continue;
 
                         // 每次只保留同一个托盘图标，新的消息替换旧的气泡。
-                        nid.hIcon = hAvatar ? hAvatar : hIconTray;
-                        nid.uID = nid.uID % 0xFFFF + 1;
-                        nid.uFlags = NIF_ICON | NIF_TIP | NIF_MESSAGE;
-                        nid.uVersion = 0;
-                        if (Shell_NotifyIconW(NIM_ADD, &nid))
+                        nid.hIcon = hIconTray;
+                        nid.uFlags = NIF_ICON | NIF_TIP | NIF_MESSAGE | NIF_STATE;
+                        nid.dwState = NIS_HIDDEN;
+                        nid.dwStateMask = NIS_HIDDEN;
+                        const bool alreadyAdded = iconAdded;
+                        if (iconAdded || Shell_NotifyIconW(NIM_ADD, &nid))
                         {
                             iconAdded = true;
                             OutputDebugPrintf("[Toast] NIM_ADD success");
 
                             nid.uVersion = NOTIFYICON_VERSION_4;
-                            if (!Shell_NotifyIconW(NIM_SETVERSION, &nid))
+                            if (!alreadyAdded && !Shell_NotifyIconW(NIM_SETVERSION, &nid))
                             {
                                 OutputDebugPrintf("[Toast] NIM_SETVERSION failed: %lu", GetLastError());
                             }
 
                             nid.uFlags = NIF_INFO | NIF_REALTIME;
+                            nid.szInfo[0] = L'\0';
+                            if (alreadyAdded)
+                                Shell_NotifyIconW(NIM_MODIFY, &nid);
                             wcsncpy_s(nid.szInfoTitle,
                                 sizeof(nid.szInfoTitle) / sizeof(nid.szInfoTitle[0]),
-                                np.from, _TRUNCATE);
+                                np.from[0] ? np.from : L"新消息", _TRUNCATE);
                             wcsncpy_s(nid.szInfo,
                                 sizeof(nid.szInfo) / sizeof(nid.szInfo[0]),
                                 np.content, _TRUNCATE);
@@ -570,6 +648,7 @@ static DWORD WINAPI NotificationThread(LPVOID param)
                             {
                                 displayedNotification = np;
                                 displayedNotification.id = nid.uID;
+                                generation = np.generation;
                                 OutputDebugPrintf("[Toast] Balloon tip displayed");
                             }
                             balloonEnd = GetTickCount() + 6000;
@@ -581,19 +660,19 @@ static DWORD WINAPI NotificationThread(LPVOID param)
                     }
                 }
 
-                MSG message = {};
-                while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE))
-                {
-                    TranslateMessage(&message);
-                    DispatchMessageW(&message);
-                }
-
                 if (iconAdded && static_cast<LONG>(GetTickCount() - balloonEnd) >= 0)
                 {
                     Shell_NotifyIconW(NIM_DELETE, &nid);
                     iconAdded = false;
                 }
 
+            }
+
+            MSG message = {};
+            while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE))
+            {
+                TranslateMessage(&message);
+                DispatchMessageW(&message);
             }
 
             HANDLE event = g_notificationEvent;
@@ -622,6 +701,8 @@ static DWORD WINAPI NotificationThread(LPVOID param)
         DestroyIcon(hIconTray);
     if (hWnd)
         DestroyWindow(hWnd);
+    if (SUCCEEDED(comResult))
+        CoUninitialize();
     InterlockedExchange(&g_notificationWorkerRunning, 0);
     return 1;
 }
@@ -630,6 +711,11 @@ static void ShowNotification(const char* from, const char* content,
     const char* avatar_url = nullptr, const char* conversation = nullptr,
     HWND chat_window = nullptr)
 {
+    if (IsWeChatForeground())
+    {
+        CancelWindowsNotifications();
+        return;
+    }
     const bool locked = IsWorkstationLocked();
 
     NotificationParams np = {};
@@ -649,6 +735,8 @@ static void ShowNotification(const char* from, const char* content,
     HANDLE event = nullptr;
     AcquireSRWLockExclusive(&g_notificationLock);
     const DWORD now = GetTickCount();
+    np.queuedAt = now;
+    np.generation = g_notificationGeneration;
     if (!locked && now - g_LastNotifyTime < 3000)
     {
         ReleaseSRWLockExclusive(&g_notificationLock);
@@ -693,6 +781,58 @@ using FlashWindowFunc = BOOL (WINAPI *)(HWND, BOOL);
 static FlashWindowExFunc g_originalFlashWindowEx = nullptr;
 static FlashWindowFunc g_originalFlashWindow = nullptr;
 
+using CreateProcessWFn = BOOL (WINAPI *)(LPCWSTR, LPWSTR, LPSECURITY_ATTRIBUTES,
+    LPSECURITY_ATTRIBUTES, BOOL, DWORD, LPVOID, LPCWSTR, LPSTARTUPINFOW, LPPROCESS_INFORMATION);
+using CreateProcessAFn = BOOL (WINAPI *)(LPCSTR, LPSTR, LPSECURITY_ATTRIBUTES,
+    LPSECURITY_ATTRIBUTES, BOOL, DWORD, LPVOID, LPCSTR, LPSTARTUPINFOA, LPPROCESS_INFORMATION);
+using ShellExecuteExWFn = BOOL (WINAPI *)(SHELLEXECUTEINFOW *);
+using ShellExecuteWFn = HINSTANCE (WINAPI *)(HWND, LPCWSTR, LPCWSTR, LPCWSTR, LPCWSTR, INT);
+using ShowWindowFn = BOOL (WINAPI *)(HWND, int);
+using SetWindowPosFn = BOOL (WINAPI *)(HWND, HWND, int, int, int, int, UINT);
+static CreateProcessWFn g_originalCreateProcessW = nullptr;
+static CreateProcessAFn g_originalCreateProcessA = nullptr;
+static ShellExecuteExWFn g_originalShellExecuteExW = nullptr;
+static ShellExecuteWFn g_originalShellExecuteW = nullptr;
+static ShowWindowFn g_originalShowWindow = nullptr;
+static SetWindowPosFn g_originalSetWindowPos = nullptr;
+
+extern "C" bool ShouldBlockUpdateWindowShow(HWND hwnd);
+
+static bool IsWindowShowCommand(int nCmdShow)
+{
+    switch (nCmdShow)
+    {
+    case SW_HIDE:
+    case SW_MINIMIZE:
+    case SW_SHOWMINIMIZED:
+    case SW_SHOWMINNOACTIVE:
+    case SW_FORCEMINIMIZE:
+        return false;
+    default:
+        return true;
+    }
+}
+
+static void LogBlockedWindowApi(const char *api, HWND hwnd, const void *ret)
+{
+    HMODULE weixin = GetModuleHandleW(L"Weixin.dll");
+    if (weixin != nullptr)
+    {
+        auto *base = reinterpret_cast<uint8_t *>(weixin);
+        auto *dos = reinterpret_cast<IMAGE_DOS_HEADER *>(base);
+        auto *nt = reinterpret_cast<IMAGE_NT_HEADERS64 *>(base + dos->e_lfanew);
+        auto *end = base + nt->OptionalHeader.SizeOfImage;
+        auto *p = reinterpret_cast<const uint8_t *>(ret);
+        if (p >= base && p < end)
+        {
+            OutputDebugPrintf("[Hook] Blocked %s hwnd=%p weixin_rva=0x%X",
+                api, hwnd, (unsigned)(p - base));
+            return;
+        }
+    }
+    OutputDebugPrintf("[Hook] Blocked %s hwnd=%p ret=%p", api, hwnd, ret);
+}
+
 static std::string WideToUtf8(const wchar_t *value)
 {
     if (value == nullptr || value[0] == L'\0')
@@ -709,7 +849,8 @@ static std::string WideToUtf8(const wchar_t *value)
 }
 
 static bool CopyShellNotification(const NOTIFYICONDATAW *data,
-    wchar_t *title, size_t titleCount, wchar_t *body, size_t bodyCount)
+    wchar_t *title, size_t titleCount, wchar_t *body, size_t bodyCount,
+    NOTIFYICONDATAW &copy)
 {
     if (data == nullptr || title == nullptr || body == nullptr)
         return false;
@@ -718,6 +859,7 @@ static bool CopyShellNotification(const NOTIFYICONDATAW *data,
     {
         if (!(data->uFlags & NIF_INFO))
             return false;
+        memcpy(&copy, data, (std::min)(static_cast<size_t>(data->cbSize), sizeof(copy)));
         wcsncpy_s(title, titleCount, data->szInfoTitle, _TRUNCATE);
         wcsncpy_s(body, bodyCount, data->szInfo, _TRUNCATE);
         return body[0] != L'\0';
@@ -729,11 +871,11 @@ static bool CopyShellNotification(const NOTIFYICONDATAW *data,
 }
 
 static bool CaptureShellNotification(const NOTIFYICONDATAW *data,
-    std::string &from, std::string &content)
+    std::string &from, std::string &content, NOTIFYICONDATAW &copy)
 {
     wchar_t title[sizeof(data->szInfoTitle) / sizeof(wchar_t)] = {};
     wchar_t body[sizeof(data->szInfo) / sizeof(wchar_t)] = {};
-    if (!CopyShellNotification(data, title, _countof(title), body, _countof(body)))
+    if (!CopyShellNotification(data, title, _countof(title), body, _countof(body), copy))
         return false;
     from = WideToUtf8(title);
     content = WideToUtf8(body);
@@ -765,7 +907,9 @@ static bool HookIatEntry(HMODULE module, const char *dllName, const char *functi
     {
         const char *name = reinterpret_cast<const char *>(
             reinterpret_cast<uint8_t *>(module) + descriptor->Name);
-        if (_stricmp(name, dllName) != 0 || descriptor->OriginalFirstThunk == 0)
+        if (descriptor->OriginalFirstThunk == 0)
+            continue;
+        if (dllName != nullptr && _stricmp(name, dllName) != 0)
             continue;
 
         auto *thunk = reinterpret_cast<IMAGE_THUNK_DATA64 *>(
@@ -827,7 +971,7 @@ static bool HookDelayIatEntry(HMODULE module, const char *dllName, const char *f
     for (; descriptor->rvaDLLName != 0; ++descriptor)
     {
         auto *name = reinterpret_cast<const char *>(base + descriptor->rvaDLLName);
-        if (_stricmp(name, dllName) != 0)
+        if (dllName != nullptr && _stricmp(name, dllName) != 0)
             continue;
 
         auto *thunk = reinterpret_cast<IMAGE_THUNK_DATA64 *>(base + descriptor->rvaIAT);
@@ -867,12 +1011,15 @@ static BOOL WINAPI HookedShellNotifyIconW(DWORD message, PNOTIFYICONDATAW data)
 {
     std::string from;
     std::string content;
+    NOTIFYICONDATAW copy = {};
     const bool capture = !g_insideShellNotifyHook &&
         (message == NIM_ADD || message == NIM_MODIFY) &&
-        CaptureShellNotification(data, from, content);
+        CaptureShellNotification(data, from, content, copy);
+    if (capture)
+        copy.uFlags &= ~(NIF_INFO | NIF_REALTIME);
 
     BOOL result = g_originalShellNotifyIconW != nullptr
-        ? g_originalShellNotifyIconW(message, data)
+        ? g_originalShellNotifyIconW(message, capture ? &copy : data)
         : FALSE;
 
     if (capture)
@@ -988,6 +1135,256 @@ bool InitNotifyIatHook()
 
     if (!success)
         OutputDebugPrintf("[Hook] Shell_NotifyIconW IAT entry not found");
+    return success;
+}
+
+static bool TextLooksLikeUpdaterW(const wchar_t *text)
+{
+    if (text == nullptr || text[0] == L'\0')
+        return false;
+    static const wchar_t *kNeedles[] = {
+        L"WeixinUpdate",
+        L"WeChatUpdate",
+    };
+    for (const wchar_t *needle : kNeedles)
+    {
+        const size_t n = wcslen(needle);
+        for (const wchar_t *p = text; *p; ++p)
+        {
+            if (_wcsnicmp(p, needle, n) == 0)
+                return true;
+        }
+    }
+    return false;
+}
+
+static bool TextLooksLikeUpdaterA(const char *text)
+{
+    if (text == nullptr || text[0] == '\0')
+        return false;
+    static const char *kNeedles[] = {
+        "WeixinUpdate",
+        "WeChatUpdate",
+    };
+    for (const char *needle : kNeedles)
+    {
+        const size_t n = strlen(needle);
+        for (const char *p = text; *p; ++p)
+        {
+            if (_strnicmp(p, needle, n) == 0)
+                return true;
+        }
+    }
+    return false;
+}
+
+static BOOL WINAPI HookedCreateProcessW(
+    LPCWSTR application, LPWSTR commandLine, LPSECURITY_ATTRIBUTES processAttributes,
+    LPSECURITY_ATTRIBUTES threadAttributes, BOOL inheritHandles, DWORD creationFlags,
+    LPVOID environment, LPCWSTR currentDirectory, LPSTARTUPINFOW startupInfo,
+    LPPROCESS_INFORMATION processInformation)
+{
+    if (TextLooksLikeUpdaterW(application) || TextLooksLikeUpdaterW(commandLine))
+    {
+        if (processInformation != nullptr)
+            ZeroMemory(processInformation, sizeof(*processInformation));
+        SetLastError(ERROR_FILE_NOT_FOUND);
+        OutputDebugPrintf("[Hook] Blocked CreateProcessW updater");
+        return FALSE;
+    }
+    return g_originalCreateProcessW != nullptr
+        ? g_originalCreateProcessW(application, commandLine, processAttributes, threadAttributes,
+            inheritHandles, creationFlags, environment, currentDirectory, startupInfo, processInformation)
+        : FALSE;
+}
+
+static BOOL WINAPI HookedCreateProcessA(
+    LPCSTR application, LPSTR commandLine, LPSECURITY_ATTRIBUTES processAttributes,
+    LPSECURITY_ATTRIBUTES threadAttributes, BOOL inheritHandles, DWORD creationFlags,
+    LPVOID environment, LPCSTR currentDirectory, LPSTARTUPINFOA startupInfo,
+    LPPROCESS_INFORMATION processInformation)
+{
+    if (TextLooksLikeUpdaterA(application) || TextLooksLikeUpdaterA(commandLine))
+    {
+        if (processInformation != nullptr)
+            ZeroMemory(processInformation, sizeof(*processInformation));
+        SetLastError(ERROR_FILE_NOT_FOUND);
+        OutputDebugPrintf("[Hook] Blocked CreateProcessA updater");
+        return FALSE;
+    }
+    return g_originalCreateProcessA != nullptr
+        ? g_originalCreateProcessA(application, commandLine, processAttributes, threadAttributes,
+            inheritHandles, creationFlags, environment, currentDirectory, startupInfo, processInformation)
+        : FALSE;
+}
+
+static BOOL WINAPI HookedShellExecuteExW(SHELLEXECUTEINFOW *info)
+{
+    if (info != nullptr && (TextLooksLikeUpdaterW(info->lpFile) || TextLooksLikeUpdaterW(info->lpParameters)))
+    {
+        SetLastError(ERROR_FILE_NOT_FOUND);
+        OutputDebugPrintf("[Hook] Blocked ShellExecuteExW updater");
+        return FALSE;
+    }
+    return g_originalShellExecuteExW != nullptr ? g_originalShellExecuteExW(info) : FALSE;
+}
+
+static HINSTANCE WINAPI HookedShellExecuteW(
+    HWND hwnd, LPCWSTR operation, LPCWSTR file, LPCWSTR parameters, LPCWSTR directory, INT show)
+{
+    if (TextLooksLikeUpdaterW(file) || TextLooksLikeUpdaterW(parameters))
+    {
+        SetLastError(ERROR_FILE_NOT_FOUND);
+        OutputDebugPrintf("[Hook] Blocked ShellExecuteW updater");
+        return (HINSTANCE)(ULONG_PTR)SE_ERR_FNF;
+    }
+    return g_originalShellExecuteW != nullptr
+        ? g_originalShellExecuteW(hwnd, operation, file, parameters, directory, show)
+        : (HINSTANCE)(ULONG_PTR)SE_ERR_FNF;
+}
+
+static BOOL WINAPI HookedShowWindow(HWND hwnd, int nCmdShow)
+{
+    if (IsWindowShowCommand(nCmdShow) && ShouldBlockUpdateWindowShow(hwnd))
+    {
+        LogBlockedWindowApi("ShowWindow", hwnd, _ReturnAddress());
+        if (g_originalShowWindow != nullptr)
+            g_originalShowWindow(hwnd, SW_HIDE);
+        return TRUE;
+    }
+    return g_originalShowWindow != nullptr ? g_originalShowWindow(hwnd, nCmdShow) : FALSE;
+}
+
+static BOOL WINAPI HookedSetWindowPos(
+    HWND hwnd, HWND insertAfter, int x, int y, int cx, int cy, UINT flags)
+{
+    if ((flags & SWP_SHOWWINDOW) != 0 && (flags & SWP_HIDEWINDOW) == 0
+        && ShouldBlockUpdateWindowShow(hwnd))
+    {
+        LogBlockedWindowApi("SetWindowPos", hwnd, _ReturnAddress());
+        flags = (flags & ~SWP_SHOWWINDOW) | SWP_HIDEWINDOW;
+    }
+    return g_originalSetWindowPos != nullptr
+        ? g_originalSetWindowPos(hwnd, insertAfter, x, y, cx, cy, flags)
+        : FALSE;
+}
+
+static bool HookNamedImport(HMODULE module, const char *functionName, void *replacement, void **original)
+{
+    bool hooked = HookIatEntry(module, nullptr, functionName, replacement, original);
+    if (HookDelayIatEntry(module, nullptr, functionName, replacement, original))
+        hooked = true;
+    return hooked;
+}
+
+bool InitUpdateIatHook()
+{
+    HMODULE kernel32 = GetModuleHandleA("kernel32.dll");
+    HMODULE shell32 = GetModuleHandleA("shell32.dll");
+    HMODULE user32 = GetModuleHandleA("user32.dll");
+    if (g_originalCreateProcessW == nullptr && kernel32 != nullptr)
+        g_originalCreateProcessW = reinterpret_cast<CreateProcessWFn>(
+            GetProcAddress(kernel32, "CreateProcessW"));
+    if (g_originalCreateProcessA == nullptr && kernel32 != nullptr)
+        g_originalCreateProcessA = reinterpret_cast<CreateProcessAFn>(
+            GetProcAddress(kernel32, "CreateProcessA"));
+    if (g_originalShellExecuteExW == nullptr && shell32 != nullptr)
+        g_originalShellExecuteExW = reinterpret_cast<ShellExecuteExWFn>(
+            GetProcAddress(shell32, "ShellExecuteExW"));
+    if (g_originalShellExecuteW == nullptr && shell32 != nullptr)
+        g_originalShellExecuteW = reinterpret_cast<ShellExecuteWFn>(
+            GetProcAddress(shell32, "ShellExecuteW"));
+    if (g_originalShowWindow == nullptr && user32 != nullptr)
+        g_originalShowWindow = reinterpret_cast<ShowWindowFn>(
+            GetProcAddress(user32, "ShowWindow"));
+    if (g_originalSetWindowPos == nullptr && user32 != nullptr)
+        g_originalSetWindowPos = reinterpret_cast<SetWindowPosFn>(
+            GetProcAddress(user32, "SetWindowPos"));
+
+    HMODULE modules[256] = {};
+    int count = 0;
+    modules[count++] = GetModuleHandleA(nullptr);
+    modules[count++] = GetModuleHandleA("Weixin.dll");
+
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
+    if (snap != INVALID_HANDLE_VALUE)
+    {
+        MODULEENTRY32W me{};
+        me.dwSize = sizeof(me);
+        if (Module32FirstW(snap, &me))
+        {
+            do
+            {
+                if (count >= 256)
+                    break;
+                if (_wcsicmp(me.szModule, L"Weixin.exe") != 0
+                    && _wcsicmp(me.szModule, L"Weixin.dll") != 0
+                    && _wcsnicmp(me.szModule, L"Qt", 2) != 0)
+                    continue;
+                bool seen = false;
+                for (int i = 0; i < count; ++i)
+                {
+                    if (modules[i] == me.hModule)
+                    {
+                        seen = true;
+                        break;
+                    }
+                }
+                if (!seen)
+                    modules[count++] = me.hModule;
+            } while (Module32NextW(snap, &me));
+        }
+        CloseHandle(snap);
+    }
+
+    bool success = false;
+    for (int i = 0; i < count; ++i)
+    {
+        HMODULE module = modules[i];
+        if (module == nullptr)
+            continue;
+
+        void *originalW = reinterpret_cast<void *>(g_originalCreateProcessW);
+        if (HookNamedImport(module, "CreateProcessW",
+            reinterpret_cast<void *>(HookedCreateProcessW), &originalW)
+            && originalW != nullptr && originalW != reinterpret_cast<void *>(HookedCreateProcessW))
+            g_originalCreateProcessW = reinterpret_cast<CreateProcessWFn>(originalW);
+
+        void *originalA = reinterpret_cast<void *>(g_originalCreateProcessA);
+        if (HookNamedImport(module, "CreateProcessA",
+            reinterpret_cast<void *>(HookedCreateProcessA), &originalA)
+            && originalA != nullptr && originalA != reinterpret_cast<void *>(HookedCreateProcessA))
+            g_originalCreateProcessA = reinterpret_cast<CreateProcessAFn>(originalA);
+
+        void *originalEx = reinterpret_cast<void *>(g_originalShellExecuteExW);
+        if (HookNamedImport(module, "ShellExecuteExW",
+            reinterpret_cast<void *>(HookedShellExecuteExW), &originalEx)
+            && originalEx != nullptr && originalEx != reinterpret_cast<void *>(HookedShellExecuteExW))
+            g_originalShellExecuteExW = reinterpret_cast<ShellExecuteExWFn>(originalEx);
+
+        void *originalSh = reinterpret_cast<void *>(g_originalShellExecuteW);
+        if (HookNamedImport(module, "ShellExecuteW",
+            reinterpret_cast<void *>(HookedShellExecuteW), &originalSh)
+            && originalSh != nullptr && originalSh != reinterpret_cast<void *>(HookedShellExecuteW))
+            g_originalShellExecuteW = reinterpret_cast<ShellExecuteWFn>(originalSh);
+
+        void *originalShow = reinterpret_cast<void *>(g_originalShowWindow);
+        if (HookNamedImport(module, "ShowWindow",
+            reinterpret_cast<void *>(HookedShowWindow), &originalShow)
+            && originalShow != nullptr && originalShow != reinterpret_cast<void *>(HookedShowWindow))
+            g_originalShowWindow = reinterpret_cast<ShowWindowFn>(originalShow);
+
+        void *originalPos = reinterpret_cast<void *>(g_originalSetWindowPos);
+        if (HookNamedImport(module, "SetWindowPos",
+            reinterpret_cast<void *>(HookedSetWindowPos), &originalPos)
+            && originalPos != nullptr && originalPos != reinterpret_cast<void *>(HookedSetWindowPos))
+            g_originalSetWindowPos = reinterpret_cast<SetWindowPosFn>(originalPos);
+
+        success = true;
+    }
+
+    if (success)
+        OutputDebugPrintf("[Hook] Update CreateProcess/ShellExecute IAT hooked");
     return success;
 }
 
