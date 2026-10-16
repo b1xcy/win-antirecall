@@ -29,12 +29,12 @@ public partial class MainWindow : Window
                 await Task.Run(() => UpdateBlocker.Apply(Log));
             }
 
-            SetStatus("启动微信...");
+            SetStatus("启动某绿色软件...");
             TrayWait.StartWeChat();
             Log("已请求启动 Weixin.exe（若尚未运行）");
 
             SetStatus("等待登录（托盘图标）...");
-            Log("请在微信窗口中登录。检测到托盘后会自动注入；未登录就关闭微信时本程序会一起退出。");
+            Log("请在某绿色软件窗口中登录。检测到托盘后会自动注入；未登录就关闭某绿色软件时本程序会一起退出。");
             var pid = await Task.Run(() => TrayWait.WaitForLoginPid(Log));
             Log($"登录完成 pid={pid}");
             await Task.Delay(800);

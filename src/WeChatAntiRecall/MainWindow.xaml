@@ -10,7 +10,7 @@
         Background="#FF111827">
     <DockPanel Margin="18">
         <TextBlock DockPanel.Dock="Top"
-                   Text="微信 4 防撤回"
+                   Text="某绿色软件 4 防撤回"
                    FontSize="20"
                    FontWeight="SemiBold"
                    Foreground="White"/>

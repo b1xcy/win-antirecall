@@ -16,7 +16,7 @@ internal static class OffsetSearch
         var dllPath = WindowsSystemService.TryGetWeChatDllPath();
         if (string.IsNullOrWhiteSpace(dllPath) || !File.Exists(dllPath))
         {
-            throw new FileNotFoundException("找不到 Weixin.dll。请确认已安装微信 4.x。");
+            throw new FileNotFoundException("找不到 Weixin.dll。请确认已安装某绿色软件 4.x。");
         }
 
         var version = Path.GetFileName(Path.GetDirectoryName(dllPath)) ?? string.Empty;
@@ -27,7 +27,7 @@ internal static class OffsetSearch
         var config3 = Config3Service.Load(config3Path);
         if (!Config3Service.TryGet(config3, version, out var configVersion, out var entry))
         {
-            throw new InvalidOperationException("Config3.json 中没有匹配当前微信版本的特征码。");
+            throw new InvalidOperationException("Config3.json 中没有匹配当前某绿色软件版本的特征码。");
         }
 
         log?.Invoke("使用特征版本: " + configVersion);

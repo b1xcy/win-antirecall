@@ -30,7 +30,7 @@ internal static class TrayWait
 
     public static void StartWeChat()
     {
-        var exe = GetWeixinExePath() ?? throw new InvalidOperationException("找不到 Weixin.exe，请确认已安装微信 4.x。");
+        var exe = GetWeixinExePath() ?? throw new InvalidOperationException("找不到 Weixin.exe，请确认已安装某绿色软件 4.x。");
         if (Process.GetProcessesByName("Weixin").Length > 0)
         {
             return;
@@ -49,7 +49,7 @@ internal static class TrayWait
     {
         if (!WaitUntilWeixinRunning(TimeSpan.FromSeconds(30), log))
         {
-            throw new InvalidOperationException("微信未能启动。");
+            throw new InvalidOperationException("某绿色软件未能启动。");
         }
 
         var lastLog = DateTime.MinValue;
@@ -67,7 +67,7 @@ internal static class TrayWait
 
             if (!IsWeixinRunning())
             {
-                throw new WeChatExitedException("微信已退出（未登录）。");
+                throw new WeChatExitedException("某绿色软件已退出（未登录）。");
             }
 
             if (DateTime.UtcNow - lastLog > TimeSpan.FromSeconds(5))

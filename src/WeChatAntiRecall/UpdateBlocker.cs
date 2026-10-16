@@ -272,7 +272,7 @@ internal static class UpdateBlocker
 
         if (!found)
         {
-            log?.Invoke("未发现微信更新计划任务（已跳过）");
+            log?.Invoke("未发现某绿色软件更新计划任务（已跳过）");
         }
     }
 
