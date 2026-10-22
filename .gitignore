@@ -1,0 +1,15 @@
+**/bin/
+**/obj/
+**/x64/
+**/[Dd]ebug/
+**/[Rr]elease/
+dist/
+*.obj
+*.lib
+*.exp
+*.pdb
+native/*.exe
+*.user
+.vs/
+RevokeHook.log
+RevokeHook.ini
