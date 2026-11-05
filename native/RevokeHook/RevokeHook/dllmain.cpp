@@ -731,6 +731,12 @@ static bool HwndLooksLikeQtWindow(HWND hwnd)
 
 extern "C" bool ShouldBlockUpdateWindowShow(HWND hwnd)
 {
+    return g_block_update && hwnd != nullptr &&
+           GetPropW(hwnd, L"GreenSoftAntiRecall.UpdatePrompt") != nullptr;
+}
+
+static bool IsUpdatePromptWindow(HWND hwnd)
+{
     static thread_local bool inCheck = false;
     if (!g_block_update || hwnd == nullptr || !IsWindow(hwnd) || inCheck)
         return false;
@@ -815,6 +821,7 @@ static void DismissUpdateWindow(HWND hwnd, IUIAutomationElement *el)
 
     if (hwnd != nullptr && IsWindow(hwnd))
     {
+        SetPropW(hwnd, L"GreenSoftAntiRecall.UpdatePrompt", reinterpret_cast<HANDLE>(1));
         ShowWindow(hwnd, SW_HIDE);
         PostMessageW(hwnd, WM_CLOSE, 0, 0);
         OutputDebugPrintf("[RevokeHook] Closed update prompt hwnd=%p", hwnd);
@@ -886,7 +893,7 @@ static BOOL CALLBACK CloseUpdatePromptProc(HWND hwnd, LPARAM)
         return TRUE;
     if (!IsWindowVisible(hwnd) && !HwndLooksLikeQtWindow(hwnd))
         return TRUE;
-    if (!ShouldBlockUpdateWindowShow(hwnd))
+    if (!IsUpdatePromptWindow(hwnd))
         return TRUE;
     DismissUpdateWindow(hwnd, nullptr);
     return TRUE;
@@ -906,7 +913,7 @@ static void CALLBACK OnUpdateShowEvent(
         return;
     if (idObject != OBJID_WINDOW || idChild != CHILDID_SELF)
         return;
-    if (ShouldBlockUpdateWindowShow(hwnd))
+    if (IsUpdatePromptWindow(hwnd))
         DismissUpdateWindow(hwnd, nullptr);
 }
 
@@ -942,8 +949,8 @@ static DWORD WINAPI UpdateBlockerThread(LPVOID)
     if (g_selfModule != nullptr)
     {
         g_updateShowEventHook = SetWinEventHook(
-            EVENT_OBJECT_SHOW, EVENT_OBJECT_SHOW, g_selfModule,
-            OnUpdateShowEvent, GetCurrentProcessId(), 0, WINEVENT_INCONTEXT);
+            EVENT_OBJECT_SHOW, EVENT_OBJECT_SHOW, nullptr,
+            OnUpdateShowEvent, GetCurrentProcessId(), 0, WINEVENT_OUTOFCONTEXT);
         OutputDebugPrintf("[RevokeHook] Update Show event hook=%p", g_updateShowEventHook);
     }
 
@@ -957,7 +964,22 @@ static DWORD WINAPI UpdateBlockerThread(LPVOID)
         KillUpdaterOnce();
         CloseUpdatePromptWindows();
         ++round;
-        Sleep(round < 5 ? 400 : 2000);
+        const ULONGLONG deadline = GetTickCount64() + (round < 5 ? 400 : 2000);
+        while (InterlockedCompareExchange(&g_stopUpdateBlocker, 0, 0) == 0)
+        {
+            const ULONGLONG now = GetTickCount64();
+            if (now >= deadline)
+                break;
+            if (MsgWaitForMultipleObjectsEx(0, nullptr, static_cast<DWORD>(deadline - now),
+                    QS_ALLINPUT, MWMO_INPUTAVAILABLE) == WAIT_TIMEOUT)
+                break;
+            MSG message;
+            while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE))
+            {
+                TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+        }
     }
     return 0;
 }
