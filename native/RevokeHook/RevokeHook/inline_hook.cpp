@@ -447,23 +447,44 @@ static bool TakePendingNotification(NotificationParams &params)
     return valid;
 }
 
+static void DismissBalloon(NOTIFYICONDATAW &nid, NotificationParams &notification)
+{
+    notification = {};
+    nid.uFlags = NIF_INFO;
+    nid.szInfo[0] = L'\0';
+    Shell_NotifyIconW(NIM_MODIFY, &nid);
+    if (!Shell_NotifyIconW(NIM_DELETE, &nid))
+        OutputDebugPrintf("[Toast] NIM_DELETE failed: %lu", GetLastError());
+}
+
 static LRESULT CALLBACK NotificationWindowProc(HWND hWnd, UINT message,
     WPARAM wParam, LPARAM lParam)
 {
-    if (message == WM_APP + 1 &&
-        (static_cast<UINT>(lParam) == NIN_BALLOONUSERCLICK ||
-         static_cast<UINT>(LOWORD(lParam)) == NIN_BALLOONUSERCLICK))
+    if (message == WM_APP + 1)
     {
         auto *notification = reinterpret_cast<NotificationParams *>(
             GetWindowLongPtrW(hWnd, GWLP_USERDATA));
         const UINT id = HIWORD(lParam) ? HIWORD(lParam) : static_cast<UINT>(wParam);
-        if (notification && notification->id == id)
+        if (!notification || !notification->id || notification->id != id)
+            return 0;
+
+        switch (LOWORD(lParam))
         {
+        case NIN_BALLOONSHOW:
+            OutputDebugPrintf("[Toast] Balloon tip displayed");
+            break;
+        case NIN_BALLOONHIDE:
+        case NIN_BALLOONTIMEOUT:
+            notification->id = 0;
+            break;
+        case NIN_BALLOONUSERCLICK:
             CancelWindowsNotifications();
             if (notification->conversation[0])
                 RequestOpenChat(*notification);
             else
                 ShellExecuteW(nullptr, L"open", target_app::LaunchUri().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+            notification->id = 0;
+            break;
         }
         return 0;
     }
@@ -488,7 +509,6 @@ static DWORD WINAPI NotificationThread(LPVOID param)
         (void)param;
 
         DWORD balloonEnd = 0;
-        UINT generation = 0;
         bool wasForeground = false;
 
         for (;;)
@@ -500,28 +520,23 @@ static DWORD WINAPI NotificationThread(LPVOID param)
             AcquireSRWLockShared(&g_notificationLock);
             const UINT currentGeneration = g_notificationGeneration;
             ReleaseSRWLockShared(&g_notificationLock);
-            if (iconAdded && (foreground || generation != currentGeneration))
+            const bool locked = InterlockedCompareExchange(&g_displayOff, 0, 0) ||
+                IsWorkstationLocked();
+            if (iconAdded && (foreground || locked || !displayedNotification.id ||
+                displayedNotification.generation != currentGeneration ||
+                static_cast<LONG>(GetTickCount() - balloonEnd) >= 0))
             {
-                Shell_NotifyIconW(NIM_DELETE, &nid);
+                DismissBalloon(nid, displayedNotification);
                 iconAdded = false;
-                displayedNotification = {};
             }
-            // 锁屏时不调用 NIM_MODIFY；保留待显示的最新一条，解锁后只显示这一条。
-            if (InterlockedCompareExchange(&g_displayOff, 0, 0) || IsWorkstationLocked())
-            {
-                if (iconAdded)
-                {
-                    Shell_NotifyIconW(NIM_DELETE, &nid);
-                    iconAdded = false;
-                }
-            }
-            else if (!foreground)
+
+            // 上一条收尾前，最新一条只留在本地，避免向 Shell 累积气泡。
+            if (!iconAdded && !locked && !foreground)
             {
                 NotificationParams np = {};
                 if (TakePendingNotification(np))
                 {
-                    if (GetTickCount() - np.queuedAt > 6000 ||
-                        np.generation != currentGeneration)
+                    if (GetTickCount() - np.queuedAt > 6000)
                         continue;
 
                     if (!hWnd)
@@ -607,7 +622,6 @@ static DWORD WINAPI NotificationThread(LPVOID param)
 
                             nid.cbSize = sizeof(NOTIFYICONDATAW);
                             nid.hWnd = hWnd;
-                            nid.uID = 1;
                             nid.uCallbackMessage = WM_APP + 1;
                             nid.hIcon = hIconTray;
                             wcsncpy_s(nid.szTip, sizeof(nid.szTip) / sizeof(nid.szTip[0]),
@@ -628,44 +642,24 @@ static DWORD WINAPI NotificationThread(LPVOID param)
                                 hAvatar = LoadAvatarIcon(avatarUrl);
                         }
 
-                        // Downloading may span a lock event or a newer queued message.
-                        const bool locked = IsWorkstationLocked();
-                        const bool nowForeground = IsTargetForeground();
-                        AcquireSRWLockExclusive(&g_notificationLock);
-                        const bool superseded = g_pendingNotificationValid;
-                        const bool cancelled = np.generation != g_notificationGeneration;
-                        if (locked && !superseded && !cancelled && !nowForeground)
-                        {
-                            g_pendingNotification = np;
-                            g_pendingNotificationValid = true;
-                        }
-                        ReleaseSRWLockExclusive(&g_notificationLock);
-                        if (InterlockedCompareExchange(&g_displayOff, 0, 0) ||
-                            locked || superseded || cancelled || nowForeground ||
-                            GetTickCount() - np.queuedAt > 6000)
-                            continue;
-
-                        // 每次只保留同一个托盘图标，新的消息替换旧的气泡。
+                        // VERSION_4 回调只携带 16 位 ID。新的 ID 可区分旧气泡的迟到回调。
+                        nid.uID = nid.uID % 0xFFFF + 1;
                         nid.hIcon = hIconTray;
                         nid.uFlags = NIF_ICON | NIF_TIP | NIF_MESSAGE | NIF_STATE;
                         nid.dwState = NIS_HIDDEN;
                         nid.dwStateMask = NIS_HIDDEN;
-                        const bool alreadyAdded = iconAdded;
-                        if (iconAdded || Shell_NotifyIconW(NIM_ADD, &nid))
+                        if (Shell_NotifyIconW(NIM_ADD, &nid))
                         {
                             iconAdded = true;
                             OutputDebugPrintf("[Toast] NIM_ADD success");
 
                             nid.uVersion = NOTIFYICON_VERSION_4;
-                            if (!alreadyAdded && !Shell_NotifyIconW(NIM_SETVERSION, &nid))
+                            if (!Shell_NotifyIconW(NIM_SETVERSION, &nid))
                             {
                                 OutputDebugPrintf("[Toast] NIM_SETVERSION failed: %lu", GetLastError());
                             }
 
                             nid.uFlags = NIF_INFO | NIF_REALTIME;
-                            nid.szInfo[0] = L'\0';
-                            if (alreadyAdded)
-                                Shell_NotifyIconW(NIM_MODIFY, &nid);
                             wcsncpy_s(nid.szInfoTitle,
                                 sizeof(nid.szInfoTitle) / sizeof(nid.szInfoTitle[0]),
                                 np.from[0] ? np.from : L"新消息", _TRUNCATE);
@@ -676,30 +670,40 @@ static DWORD WINAPI NotificationThread(LPVOID param)
                             nid.hBalloonIcon = hAvatar ? hAvatar : hIconBalloon;
                             OutputDebugPrintf("[Toast] Icon source: %s", hAvatar ? "avatar" : "fallback");
 
+                            const bool nowLocked = IsWorkstationLocked();
+                            const bool nowForeground = IsTargetForeground();
+                            AcquireSRWLockExclusive(&g_notificationLock);
+                            const bool stillCurrent = np.generation == g_notificationGeneration &&
+                                !g_pendingNotificationValid;
+                            if (nowLocked && stillCurrent && !nowForeground)
+                            {
+                                g_pendingNotification = np;
+                                g_pendingNotificationValid = true;
+                            }
+                            ReleaseSRWLockExclusive(&g_notificationLock);
+                            if (!stillCurrent || nowForeground || nowLocked ||
+                                InterlockedCompareExchange(&g_displayOff, 0, 0) ||
+                                GetTickCount() - np.queuedAt > 6000)
+                                continue;
+
+                            displayedNotification = np;
+                            displayedNotification.id = nid.uID;
                             if (!Shell_NotifyIconW(NIM_MODIFY, &nid))
                             {
+                                displayedNotification.id = 0;
                                 OutputDebugPrintf("[Toast] NIM_MODIFY failed: %lu", GetLastError());
                             }
                             else
                             {
-                                displayedNotification = np;
-                                displayedNotification.id = nid.uID;
-                                generation = np.generation;
-                                OutputDebugPrintf("[Toast] Balloon tip displayed");
+                                balloonEnd = GetTickCount() + 6000;
+                                OutputDebugPrintf("[Toast] Balloon tip submitted");
                             }
-                            balloonEnd = GetTickCount() + 6000;
                         }
                         else
                         {
                             OutputDebugPrintf("[Toast] NIM_ADD failed: %lu", GetLastError());
                         }
                     }
-                }
-
-                if (iconAdded && static_cast<LONG>(GetTickCount() - balloonEnd) >= 0)
-                {
-                    Shell_NotifyIconW(NIM_DELETE, &nid);
-                    iconAdded = false;
                 }
 
             }
@@ -728,7 +732,7 @@ static DWORD WINAPI NotificationThread(LPVOID param)
         OutputDebugPrintf("[Toast] Exception in notification thread: 0x%X", GetExceptionCode());
     }
     if (iconAdded)
-        Shell_NotifyIconW(NIM_DELETE, &nid);
+        DismissBalloon(nid, displayedNotification);
     if (hAvatar)
         DestroyIcon(hAvatar);
     if (ownsBalloonIcon)
